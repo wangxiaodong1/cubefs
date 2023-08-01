@@ -11,8 +11,12 @@ on:
     branches:
       - release-*
 
+permissions:
+  contents: read
+
 jobs:
   release-tests:
+    name: ci-release-tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo

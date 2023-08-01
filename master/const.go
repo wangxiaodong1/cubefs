@@ -32,6 +32,7 @@ const (
 	enableKey             = "enable"
 	thresholdKey          = "threshold"
 	dirQuotaKey           = "dirQuota"
+	dirLimitKey           = "dirSizeLimit"
 	dataPartitionSizeKey  = "size"
 	metaPartitionCountKey = "mpCount"
 	volCapacityKey        = "capacity"
@@ -85,6 +86,7 @@ const (
 	txTimeoutKey               = "txTimeout"
 	txConflictRetryNumKey      = "txConflictRetryNum"
 	txConflictRetryIntervalKey = "txConflictRetryInterval"
+	txOpLimitKey               = "txOpLimit"
 	txForceResetKey            = "txForceReset"
 	QosEnableKey               = "qosEnable"
 	DiskEnableKey              = "diskenable"
@@ -112,6 +114,7 @@ const (
 	fullPathKey                = "fullPath"
 	inodeKey                   = "inode"
 	quotaKey                   = "quotaId"
+	enableQuota                = "enableQuota"
 	dpDiscardKey               = "dpDiscard"
 	ignoreDiscardKey           = "ignoreDiscard"
 )

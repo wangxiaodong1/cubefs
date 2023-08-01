@@ -16,6 +16,14 @@ RUN  mkdir -p /tmp/ltp /opt/ltp && cd /tmp/ltp \
 RUN apt-get install -y sudo python3 python3-pip
 RUN pip3 install boto3 unittest2 requests
 
+# install go tools for code format checking
+RUN wget --no-check-certificate https://ocs-cn-north1.heytapcs.com/cubefs/github/ci/go_bin.tar.gz
+RUN tar -zxf go_bin.tar.gz -C /go/
+
+# prepare env cgo flags
+RUN go env -w CGO_CFLAGS="-I/go/src/github.com/cubefs/cubefs/build/include"
+RUN go env -w CGO_LDFLAGS="-L/go/src/github.com/cubefs/cubefs/build/lib -lrocksdb -lz -lbz2 -lsnappy -llz4 -lzstd -lstdc++"
+
 # cleanup environment
 RUN apt-get install -y jq fuse \
         && rm -rf /var/lib/apt/lists/* \

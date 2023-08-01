@@ -128,6 +128,7 @@ var (
 	statusEMFILE  = errorToStatus(syscall.EMFILE)
 	statusENOTDIR = errorToStatus(syscall.ENOTDIR)
 	statusEISDIR  = errorToStatus(syscall.EISDIR)
+	statusENOSPC  = errorToStatus(syscall.ENOSPC)
 )
 var once sync.Once
 
@@ -622,6 +623,9 @@ func cfs_write(id C.int64_t, fd C.int, buf unsafe.Pointer, size C.size_t, off C.
 
 	n, err := c.write(f, int(off), buffer, flags)
 	if err != nil {
+		if err == syscall.ENOSPC {
+			return C.ssize_t(statusENOSPC)
+		}
 		return C.ssize_t(statusEIO)
 	}
 
@@ -1289,17 +1293,20 @@ func (c *client) allocFD(ino uint64, flags, mode uint32, fileCache bool, fileSiz
 			FileSize:        fileSize,
 			CacheThreshold:  c.cacheThreshold,
 		}
-
+		f.fileWriter.FreeCache()
 		switch flags & 0xff {
 		case syscall.O_RDONLY:
 			f.fileReader = blobstore.NewReader(clientConf)
+			f.fileWriter = nil
 		case syscall.O_WRONLY:
 			f.fileWriter = blobstore.NewWriter(clientConf)
+			f.fileReader = nil
 		case syscall.O_RDWR:
 			f.fileReader = blobstore.NewReader(clientConf)
 			f.fileWriter = blobstore.NewWriter(clientConf)
 		default:
 			f.fileWriter = blobstore.NewWriter(clientConf)
+			f.fileReader = nil
 		}
 	}
 	c.fdmap[fd] = f
@@ -1377,6 +1384,7 @@ func (c *client) openStream(f *file) {
 func (c *client) closeStream(f *file) {
 	_ = c.ec.CloseStream(f.ino)
 	_ = c.ec.EvictStream(f.ino)
+	f.fileWriter.FreeCache()
 	f.fileWriter = nil
 	f.fileReader = nil
 }

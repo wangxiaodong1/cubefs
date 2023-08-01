@@ -31,6 +31,7 @@ type MasterQuotaManager struct {
 	IdQuotaInfoMap map[uint32]*proto.QuotaInfo
 	vol            *Vol
 	c              *Cluster
+
 	sync.RWMutex
 }
 
@@ -53,6 +54,16 @@ func (mqMgr *MasterQuotaManager) createQuota(req *proto.SetMasterQuotaReuqest) (
 				if pathInfo.FullPath == quotaPathInfo.FullPath {
 					err = errors.NewErrorf("path [%v] is the same as quotaId [%v]",
 						pathInfo.FullPath, quotaInfo.QuotaId)
+					return
+				}
+
+				if proto.IsAncestor(pathInfo.FullPath, quotaPathInfo.FullPath) {
+					err = errors.NewErrorf("Nested directories found: %s and %s", pathInfo.FullPath, quotaPathInfo.FullPath)
+					return
+				}
+
+				if proto.IsAncestor(quotaPathInfo.FullPath, pathInfo.FullPath) {
+					err = errors.NewErrorf("Nested directories found: %s and %s", pathInfo.FullPath, quotaPathInfo.FullPath)
 					return
 				}
 			}
@@ -199,31 +210,6 @@ func (mqMgr *MasterQuotaManager) deleteQuota(quotaId uint32) (err error) {
 	return
 }
 
-func (mqMgr *MasterQuotaManager) getQuotaInfoById(quotaId uint32) (quotaInfo *proto.QuotaInfo, err error) {
-	var isFind bool
-	mqMgr.RLock()
-	defer mqMgr.RUnlock()
-	if quotaInfo, isFind = mqMgr.IdQuotaInfoMap[quotaId]; isFind {
-		err = nil
-		return
-	} else {
-		err = errors.New("quota is exist.")
-	}
-	return
-}
-
-func (mqMgr *MasterQuotaManager) DeleteQuotaInfoById(quotaId uint32) {
-	mqMgr.Lock()
-	defer mqMgr.Unlock()
-
-	_, isFind := mqMgr.IdQuotaInfoMap[quotaId]
-	if isFind {
-		delete(mqMgr.IdQuotaInfoMap, quotaId)
-		log.LogInfof("DeleteQuotaInfoById delete quotaId [%v] success.", quotaId)
-	}
-	return
-}
-
 func (mqMgr *MasterQuotaManager) quotaUpdate(report *proto.MetaPartitionReport) {
 	var (
 		quotaInfo = &proto.QuotaInfo{}
@@ -245,11 +231,11 @@ func (mqMgr *MasterQuotaManager) quotaUpdate(report *proto.MetaPartitionReport) 
 		quotaInfo.UsedInfo.UsedFiles = 0
 		quotaInfo.UsedInfo.UsedBytes = 0
 	}
-	deleteQuotaIds := make([]uint32, 0, 0)
+	deleteQuotaIds := make(map[uint32]bool, 0)
 	for mpId, reportInfos := range mqMgr.MpQuotaInfoMap {
 		for _, info := range reportInfos {
 			if _, isFind := mqMgr.IdQuotaInfoMap[info.QuotaId]; !isFind {
-				deleteQuotaIds = append(deleteQuotaIds, info.QuotaId)
+				deleteQuotaIds[info.QuotaId] = true
 				continue
 			}
 			log.LogDebugf("[quotaUpdate] mpId [%v] quotaId [%v] reportinfo [%v]", mpId, info.QuotaId, info.UsedInfo)
@@ -285,6 +271,7 @@ func (mqMgr *MasterQuotaManager) getQuotaHbInfos() (infos []*proto.QuotaHeartBea
 		info.QuotaId = quotaId
 		info.LimitedInfo.LimitedFiles = quotaInfo.LimitedInfo.LimitedFiles
 		info.LimitedInfo.LimitedBytes = quotaInfo.LimitedInfo.LimitedBytes
+		info.Enable = mqMgr.vol.enableQuota
 		infos = append(infos, info)
 		log.LogDebugf("getQuotaHbInfos info %v", info)
 	}

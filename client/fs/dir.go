@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -611,8 +610,10 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		auditlog.FormatLog("Rename", d.getCwd()+"/"+req.OldName, dstDir.getCwd()+"/"+req.NewName, err, time.Since(start).Microseconds(), srcInode, dstInode)
 	}()
 	//changePathMap := d.super.mw.GetChangeQuota(d.getCwd()+"/"+req.OldName, dstDir.getCwd()+"/"+req.NewName)
-	if !d.canRenameByQuota(dstDir, req.OldName) {
-		return fuse.EPERM
+	if d.super.mw.EnableQuota {
+		if !d.canRenameByQuota(dstDir, req.OldName) {
+			return fuse.EPERM
+		}
 	}
 	err = d.super.mw.Rename_ll(d.info.Inode, req.OldName, dstDir.info.Inode, req.NewName, true)
 	if err != nil {
@@ -960,31 +961,18 @@ func (d *Dir) canRenameByQuota(dstDir *Dir, srcName string) bool {
 	if len(fullPaths) == 0 {
 		return true
 	}
+	var srcPath string
+	if d.getCwd() == "/" {
+		srcPath = "/" + srcName
+	} else {
+		srcPath = d.getCwd() + "/" + srcName
+	}
 
-	srcPath := d.getCwd()
-	dstPath := dstDir.getCwd()
 	for _, fullPath := range fullPaths {
-		log.LogDebugf("srcPath [%v] dstPath [%v] fullPath[%v].", srcPath, dstPath, fullPath)
-		if IsSubdirectory(fullPath, srcPath) && !IsSubdirectory(fullPath, dstPath) {
-			return false
-		}
-
-		if !IsSubdirectory(fullPath, srcPath) && IsSubdirectory(fullPath, dstPath) {
-			return false
-		}
-
-		if IsSubdirectory(srcPath+"/"+srcName, fullPath) {
+		log.LogDebugf("srcPath [%v] fullPath[%v].", srcPath, fullPath)
+		if proto.IsAncestor(srcPath, fullPath) {
 			return false
 		}
 	}
 	return true
-}
-
-func IsSubdirectory(parent, child string) bool {
-	parent = filepath.Clean(parent)
-	child = filepath.Clean(child)
-	if parent == child {
-		return true
-	}
-	return strings.HasPrefix(child, parent+string(filepath.Separator))
 }

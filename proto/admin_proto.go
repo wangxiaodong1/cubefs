@@ -44,6 +44,7 @@ const (
 	AdminCreateVol                            = "/admin/createVol"
 	AdminGetVol                               = "/admin/getVol"
 	AdminClusterFreeze                        = "/cluster/freeze"
+	AdminClusterForbidMpDecommission          = "/cluster/forbidMetaPartitionDecommission"
 	AdminClusterStat                          = "/cluster/stat"
 	AdminSetCheckDataReplicasEnable           = "/cluster/setCheckDataReplicasEnable"
 	AdminGetIP                                = "/admin/getIp"
@@ -191,44 +192,45 @@ const (
 )
 
 var GApiInfo map[string]string = map[string]string{
-	"admingetmasterapilist":           AdminGetMasterApiList,
-	"adminsetapiqpslimit":             AdminSetApiQpsLimit,
-	"admingetcluster":                 AdminGetCluster,
-	"adminsetclusterinfo":             AdminSetClusterInfo,
-	"admingetdatapartition":           AdminGetDataPartition,
-	"adminloaddatapartition":          AdminLoadDataPartition,
-	"admincreatedatapartition":        AdminCreateDataPartition,
-	"admincreatepreloaddatapartition": AdminCreatePreLoadDataPartition,
-	"admindecommissiondatapartition":  AdminDecommissionDataPartition,
-	"admindiagnosedatapartition":      AdminDiagnoseDataPartition,
-	"admindeletedatareplica":          AdminDeleteDataReplica,
-	"adminadddatareplica":             AdminAddDataReplica,
-	"admindeletevol":                  AdminDeleteVol,
-	"adminupdatevol":                  AdminUpdateVol,
-	"adminvolshrink":                  AdminVolShrink,
-	"adminvolexpand":                  AdminVolExpand,
-	"admincreatevol":                  AdminCreateVol,
-	"admingetvol":                     AdminGetVol,
-	"adminclusterfreeze":              AdminClusterFreeze,
-	"adminclusterstat":                AdminClusterStat,
-	"admingetip":                      AdminGetIP,
-	"admincreatemetapartition":        AdminCreateMetaPartition,
-	"adminsetmetanodethreshold":       AdminSetMetaNodeThreshold,
-	"adminlistvols":                   AdminListVols,
-	"adminsetnodeinfo":                AdminSetNodeInfo,
-	"admingetnodeinfo":                AdminGetNodeInfo,
-	"admingetallnodesetgrpinfo":       AdminGetAllNodeSetGrpInfo,
-	"admingetnodesetgrpinfo":          AdminGetNodeSetGrpInfo,
-	"admingetisdomainon":              AdminGetIsDomainOn,
-	"adminupdatenodesetcapcity":       AdminUpdateNodeSetCapcity,
-	"adminupdatenodesetid":            AdminUpdateNodeSetId,
-	"adminupdatedomaindatauseratio":   AdminUpdateDomainDataUseRatio,
-	"adminupdatezoneexcluderatio":     AdminUpdateZoneExcludeRatio,
-	"adminsetnoderdonly":              AdminSetNodeRdOnly,
-	"adminsetdprdonly":                AdminSetDpRdOnly,
-	"admindatapartitionchangeleader":  AdminDataPartitionChangeLeader,
-	"adminsetdpdiscard":               AdminSetDpDiscard,
-	"admingetdiscarddp":               AdminGetDiscardDp,
+	"admingetmasterapilist":            AdminGetMasterApiList,
+	"adminsetapiqpslimit":              AdminSetApiQpsLimit,
+	"admingetcluster":                  AdminGetCluster,
+	"adminsetclusterinfo":              AdminSetClusterInfo,
+	"admingetdatapartition":            AdminGetDataPartition,
+	"adminloaddatapartition":           AdminLoadDataPartition,
+	"admincreatedatapartition":         AdminCreateDataPartition,
+	"admincreatepreloaddatapartition":  AdminCreatePreLoadDataPartition,
+	"admindecommissiondatapartition":   AdminDecommissionDataPartition,
+	"admindiagnosedatapartition":       AdminDiagnoseDataPartition,
+	"admindeletedatareplica":           AdminDeleteDataReplica,
+	"adminadddatareplica":              AdminAddDataReplica,
+	"admindeletevol":                   AdminDeleteVol,
+	"adminupdatevol":                   AdminUpdateVol,
+	"adminvolshrink":                   AdminVolShrink,
+	"adminvolexpand":                   AdminVolExpand,
+	"admincreatevol":                   AdminCreateVol,
+	"admingetvol":                      AdminGetVol,
+	"adminclusterfreeze":               AdminClusterFreeze,
+	"adminclusterforbidmpdecommission": AdminClusterForbidMpDecommission,
+	"adminclusterstat":                 AdminClusterStat,
+	"admingetip":                       AdminGetIP,
+	"admincreatemetapartition":         AdminCreateMetaPartition,
+	"adminsetmetanodethreshold":        AdminSetMetaNodeThreshold,
+	"adminlistvols":                    AdminListVols,
+	"adminsetnodeinfo":                 AdminSetNodeInfo,
+	"admingetnodeinfo":                 AdminGetNodeInfo,
+	"admingetallnodesetgrpinfo":        AdminGetAllNodeSetGrpInfo,
+	"admingetnodesetgrpinfo":           AdminGetNodeSetGrpInfo,
+	"admingetisdomainon":               AdminGetIsDomainOn,
+	"adminupdatenodesetcapcity":        AdminUpdateNodeSetCapcity,
+	"adminupdatenodesetid":             AdminUpdateNodeSetId,
+	"adminupdatedomaindatauseratio":    AdminUpdateDomainDataUseRatio,
+	"adminupdatezoneexcluderatio":      AdminUpdateZoneExcludeRatio,
+	"adminsetnoderdonly":               AdminSetNodeRdOnly,
+	"adminsetdprdonly":                 AdminSetDpRdOnly,
+	"admindatapartitionchangeleader":   AdminDataPartitionChangeLeader,
+	"adminsetdpdiscard":                AdminSetDpDiscard,
+	"admingetdiscarddp":                AdminGetDiscardDp,
 
 	//"adminclusterapi":                 AdminClusterAPI,
 	//"adminuserapi":                    AdminUserAPI,
@@ -472,6 +474,16 @@ type QuotaHeartBeatInfos struct {
 	QuotaHbInfos []*QuotaHeartBeatInfo
 }
 
+type TxInfo struct {
+	Volume     string
+	Mask       uint8
+	OpLimitVal int
+}
+
+type TxInfos struct {
+	TxInfo []*TxInfo
+}
+
 // HeartBeatRequest define the heartbeat request.
 type HeartBeatRequest struct {
 	CurrTime   int64
@@ -481,6 +493,7 @@ type HeartBeatRequest struct {
 	FileStatsEnable bool
 	UidLimitToMetaNode
 	QuotaHeartBeatInfos
+	TxInfos
 }
 
 // PartitionReport defines the partition report.
@@ -820,10 +833,12 @@ type SimpleVolView struct {
 	CreateTime              string
 	EnableToken             bool
 	EnablePosixAcl          bool
+	EnableQuota             bool
 	EnableTransaction       string
 	TxTimeout               int64
 	TxConflictRetryNum      int64
 	TxConflictRetryInterval int64
+	TxOpLimit               int
 	Description             string
 	DpSelectorName          string
 	DpSelectorParm          string

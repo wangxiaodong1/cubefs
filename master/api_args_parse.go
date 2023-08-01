@@ -84,35 +84,15 @@ func extractTxConflictRetryInterval(r *http.Request) (interval int64, err error)
 	return interval, nil
 }
 
-//func extractTxMask(r *http.Request) (mask uint8, err error) {
-//
-//	var maskStr string
-//	if maskStr = r.FormValue(enableTxMaskKey); maskStr == "" {
-//		return
-//	}
-//
-//	arr := strings.Split(maskStr, "|")
-//
-//	optNum := len(arr)
-//
-//	for _, v := range arr {
-//		if m, ok := proto.GTxMaskMap[v]; ok {
-//			if optNum >= 2 && (m == proto.TxOpMaskOff || m == proto.TxOpMaskAll) {
-//				mask = proto.TxOpMaskOff
-//				err = txInvalidMask()
-//				return
-//			} else {
-//				mask = mask | m
-//			}
-//		} else {
-//			mask = proto.TxOpMaskOff
-//			err = txInvalidMask()
-//			return
-//		}
-//	}
-//
-//	return
-//}
+func extractTxOpLimitInterval(r *http.Request, volLimit int) (limit int, err error) {
+	var txLimit uint64
+	if txLimit, err = extractUint64WithDefault(r, txOpLimitKey, uint64(volLimit)); err != nil {
+		return
+	}
+
+	limit = int(txLimit)
+	return
+}
 
 func hasTxParams(r *http.Request) bool {
 	var (
@@ -142,26 +122,6 @@ func parseTxMask(r *http.Request, oldMask uint8) (mask uint8, err error) {
 	if err != nil {
 		return
 	}
-
-	/*arr := strings.Split(maskStr, "|")
-
-	optNum := len(arr)
-
-	for _, v := range arr {
-		if m, ok := proto.GTxMaskMap[v]; ok {
-			if optNum >= 2 && (m == proto.TxOpMaskOff || m == proto.TxOpMaskAll) {
-				mask = proto.TxOpMaskOff
-				err = txInvalidMask()
-				return
-			} else {
-				mask = mask | m
-			}
-		} else {
-			mask = proto.TxOpMaskOff
-			err = txInvalidMask()
-			return
-		}
-	}*/
 
 	mask, err = proto.GetMaskFromString(maskStr)
 	if err != nil {
@@ -376,6 +336,7 @@ type updateVolReq struct {
 	txTimeout               int64
 	txConflictRetryNum      int64
 	txConflictRetryInterval int64
+	txOpLimit               int
 	zoneName                string
 	description             string
 	dpSelectorName          string
@@ -383,6 +344,7 @@ type updateVolReq struct {
 	replicaNum              int
 	coldArgs                *coldVolArgs
 	dpReadOnlyWhenVolFull   bool
+	enableQuota             bool
 }
 
 func parseColdVolUpdateArgs(r *http.Request, vol *Vol) (args *coldVolArgs, err error) {
@@ -473,6 +435,10 @@ func parseVolUpdateReq(r *http.Request, vol *Vol, req *updateVolReq) (err error)
 	}
 	req.enableTransaction = txMask
 
+	if req.enableQuota, err = extractBoolWithDefault(r, enableQuota, vol.enableQuota); err != nil {
+		return
+	}
+
 	var txTimeout int64
 	if txTimeout, err = extractTxTimeout(r); err != nil {
 		return
@@ -491,9 +457,9 @@ func parseVolUpdateReq(r *http.Request, vol *Vol, req *updateVolReq) (err error)
 	}
 	req.txConflictRetryInterval = txConflictRetryInterval
 
-	//if req.enableTransaction, err = extractBoolWithDefault(r, enableTxMaskKey, vol.enableTransaction); err != nil {
-	//	return
-	//}
+	if req.txOpLimit, err = extractTxOpLimitInterval(r, vol.txOpLimit); err != nil {
+		return
+	}
 
 	if req.authenticate, err = extractBoolWithDefault(r, authenticateKey, vol.authenticate); err != nil {
 		return
@@ -641,6 +607,7 @@ type createVolReq struct {
 	volType                              int
 	enablePosixAcl                       bool
 	DpReadOnlyWhenVolFull                bool
+	enableQuota                          bool
 	enableTransaction                    uint8
 	txTimeout                            int64
 	txConflictRetryNum                   int64
@@ -801,6 +768,10 @@ func parseRequestToCreateVol(r *http.Request, req *createVolReq) (err error) {
 		return
 	}
 	req.txConflictRetryInterval = txConflictRetryInterval
+
+	if req.enableQuota, err = extractBoolWithDefault(r, enableQuota, false); err != nil {
+		return
+	}
 
 	return
 }
@@ -1016,21 +987,27 @@ func extractCrossZone(r *http.Request) (crossZone bool, err error) {
 	return
 }
 
-func parseAndExtractDirQuota(r *http.Request) (quota uint32, err error) {
+func parseAndExtractDirLimit(r *http.Request) (limit uint32, err error) {
 	if err = r.ParseForm(); err != nil {
 		return
 	}
 	var value string
-	if value = r.FormValue(dirQuotaKey); value == "" {
-		err = keyNotFound(dirQuotaKey)
-		return
+
+	value = r.FormValue(dirLimitKey)
+	if value == "" {
+		value = r.FormValue(dirQuotaKey)
+		if value == "" {
+			err = keyNotFound(dirLimitKey)
+			return
+		}
 	}
-	var tmpQuota uint64
-	if tmpQuota, err = strconv.ParseUint(value, 10, 32); err != nil {
+
+	var tmpLimit uint64
+	if tmpLimit, err = strconv.ParseUint(value, 10, 32); err != nil {
 		return
 	}
 
-	quota = uint32(tmpQuota)
+	limit = uint32(tmpLimit)
 	return
 }
 

@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/iputil"
 
 	"golang.org/x/time/rate"
@@ -108,27 +109,27 @@ type badPartitionView = proto.BadPartitionView
 
 func (m *Server) setClusterInfo(w http.ResponseWriter, r *http.Request) {
 	var (
-		quota uint32
-		err   error
+		dirLimit uint32
+		err      error
 	)
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminSetClusterInfo))
 	defer func() {
 		doStatAndMetric(proto.AdminSetClusterInfo, metric, err, nil)
 	}()
 
-	if quota, err = parseAndExtractDirQuota(r); err != nil {
+	if dirLimit, err = parseAndExtractDirLimit(r); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
-	if quota < proto.MinDirChildrenNumLimit {
-		quota = proto.MinDirChildrenNumLimit
+	if dirLimit < proto.MinDirChildrenNumLimit {
+		dirLimit = proto.MinDirChildrenNumLimit
 	}
-	if err = m.cluster.setClusterInfo(quota); err != nil {
+	if err = m.cluster.setClusterInfo(dirLimit); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
-	sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("set dir quota(min:%v, max:%v) to %v successfully",
-		proto.MinDirChildrenNumLimit, math.MaxUint32, quota)))
+	sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("set dir limit(min:%v, max:%v) to %v successfully",
+		proto.MinDirChildrenNumLimit, math.MaxUint32, dirLimit)))
 }
 
 // Set the threshold of the memory usage on each meta node.
@@ -181,6 +182,32 @@ func (m *Server) setupAutoAllocation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("set DisableAutoAllocate to %v successfully", status)))
+}
+
+func (m *Server) setupForbidMetaPartitionDecommission(w http.ResponseWriter, r *http.Request) {
+	var (
+		status bool
+		err    error
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminClusterForbidMpDecommission))
+	defer func() {
+		doStatAndMetric(proto.AdminClusterForbidMpDecommission, metric, err, nil)
+		if err != nil {
+			log.LogErrorf("set ForbidMpDecommission failed, error: %v", err)
+		} else {
+			log.LogInfof("set ForbidMpDecommission to (%v) success", status)
+		}
+	}()
+
+	if status, err = parseAndExtractStatus(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+	if err = m.cluster.setForbidMpDecommission(status); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+	sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("set ForbidMpDecommission to %v successfully", status)))
 }
 
 // View the topology of the cluster.
@@ -439,21 +466,22 @@ func (m *Server) getCluster(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	cv := &proto.ClusterView{
-		Name:                m.cluster.Name,
-		CreateTime:          time.Unix(m.cluster.CreateTime, 0).Format(proto.TimeFormat),
-		LeaderAddr:          m.leaderInfo.addr,
-		DisableAutoAlloc:    m.cluster.DisableAutoAllocate,
-		MetaNodeThreshold:   m.cluster.cfg.MetaNodeThreshold,
-		Applied:             m.fsm.applied,
-		MaxDataPartitionID:  m.cluster.idAlloc.dataPartitionID,
-		MaxMetaNodeID:       m.cluster.idAlloc.commonID,
-		MaxMetaPartitionID:  m.cluster.idAlloc.metaPartitionID,
-		MasterNodes:         make([]proto.NodeView, 0),
-		MetaNodes:           make([]proto.NodeView, 0),
-		DataNodes:           make([]proto.NodeView, 0),
-		VolStatInfo:         make([]*proto.VolStatInfo, 0),
-		BadPartitionIDs:     make([]proto.BadPartitionView, 0),
-		BadMetaPartitionIDs: make([]proto.BadPartitionView, 0),
+		Name:                 m.cluster.Name,
+		CreateTime:           time.Unix(m.cluster.CreateTime, 0).Format(proto.TimeFormat),
+		LeaderAddr:           m.leaderInfo.addr,
+		DisableAutoAlloc:     m.cluster.DisableAutoAllocate,
+		ForbidMpDecommission: m.cluster.ForbidMpDecommission,
+		MetaNodeThreshold:    m.cluster.cfg.MetaNodeThreshold,
+		Applied:              m.fsm.applied,
+		MaxDataPartitionID:   m.cluster.idAlloc.dataPartitionID,
+		MaxMetaNodeID:        m.cluster.idAlloc.commonID,
+		MaxMetaPartitionID:   m.cluster.idAlloc.metaPartitionID,
+		MasterNodes:          make([]proto.NodeView, 0),
+		MetaNodes:            make([]proto.NodeView, 0),
+		DataNodes:            make([]proto.NodeView, 0),
+		VolStatInfo:          make([]*proto.VolStatInfo, 0),
+		BadPartitionIDs:      make([]proto.BadPartitionView, 0),
+		BadMetaPartitionIDs:  make([]proto.BadPartitionView, 0),
 	}
 
 	vols := m.cluster.allVolNames()
@@ -1813,6 +1841,8 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 	newArgs.txTimeout = req.txTimeout
 	newArgs.txConflictRetryNum = req.txConflictRetryNum
 	newArgs.txConflictRetryInterval = req.txConflictRetryInterval
+	newArgs.txOpLimit = req.txOpLimit
+	newArgs.enableQuota = req.enableQuota
 	if req.coldArgs != nil {
 		newArgs.coldArgs = req.coldArgs
 	}
@@ -1827,7 +1857,6 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var response string
-
 	if hasTxParams(r) {
 		response = fmt.Sprintf("update vol[%v] successfully, txTimeout[%v] enableTransaction[%v]",
 			req.name, newArgs.txTimeout, proto.GetMaskString(newArgs.enableTransaction))
@@ -2157,10 +2186,12 @@ func newSimpleView(vol *Vol) (view *proto.SimpleVolView) {
 		Capacity:                vol.Capacity,
 		FollowerRead:            vol.FollowerRead,
 		EnablePosixAcl:          vol.enablePosixAcl,
+		EnableQuota:             vol.enableQuota,
 		EnableTransaction:       proto.GetMaskString(vol.enableTransaction),
 		TxTimeout:               vol.txTimeout,
 		TxConflictRetryNum:      vol.txConflictRetryNum,
 		TxConflictRetryInterval: vol.txConflictRetryInterval,
+		TxOpLimit:               vol.txOpLimit,
 		NeedToLowerReplica:      vol.NeedToLowerReplica,
 		Authenticate:            vol.authenticate,
 		CrossZone:               vol.crossZone,
@@ -4830,6 +4861,12 @@ func (m *Server) CreateQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !vol.enableQuota {
+		err = errors.NewErrorf("vol %v disableQuota.", vol.Name)
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+
 	if quotaId, err = vol.quotaManager.createQuota(req); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
@@ -4851,6 +4888,12 @@ func (m *Server) UpdateQuota(w http.ResponseWriter, r *http.Request) {
 	}
 	if vol, err = m.cluster.getVol(req.VolName); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(proto.ErrVolNotExists))
+		return
+	}
+
+	if !vol.enableQuota {
+		err = errors.NewErrorf("vol %v disableQuota.", vol.Name)
+		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
 

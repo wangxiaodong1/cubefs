@@ -268,7 +268,8 @@ func (api *AdminAPI) UpdateVolume(
 	txMask string,
 	txForceReset bool,
 	txConflictRetryNum int64,
-	txConflictRetryInterval int64) (err error) {
+	txConflictRetryInterval int64,
+	txOpLimit int) (err error) {
 	var request = newAPIRequest(http.MethodGet, proto.AdminUpdateVol)
 	request.addParam("name", vv.Name)
 	request.addParam("description", vv.Description)
@@ -287,6 +288,7 @@ func (api *AdminAPI) UpdateVolume(
 	request.addParam("cacheRuleKey", vv.CacheRule)
 	request.addParam("dpReadOnlyWhenVolFull", strconv.FormatBool(vv.DpReadOnlyWhenVolFull))
 	request.addParam("replicaNum", strconv.FormatUint(uint64(vv.DpReplicaNum), 10))
+	request.addParam("enableQuota", strconv.FormatBool(vv.EnableQuota))
 
 	if txMask != "" {
 		request.addParam("enableTxMask", txMask)
@@ -299,6 +301,10 @@ func (api *AdminAPI) UpdateVolume(
 
 	if txConflictRetryNum > 0 {
 		request.addParam("txConflictRetryNum", strconv.FormatInt(txConflictRetryNum, 10))
+	}
+
+	if txOpLimit > 0 {
+		request.addParam("txOpLimit", strconv.Itoa(txOpLimit))
 	}
 
 	if txConflictRetryInterval > 0 {
@@ -347,7 +353,7 @@ func (api *AdminAPI) VolExpand(volName string, capacity uint64, authKey string) 
 func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, crossZone, normalZonesFirst bool, business string,
 	mpCount, replicaNum, size, volType int, followerRead bool, zoneName, cacheRuleKey string, ebsBlkSize,
 	cacheCapacity, cacheAction, cacheThreshold, cacheTTL, cacheHighWater, cacheLowWater, cacheLRUInterval int,
-	dpReadOnlyWhenVolFull bool, txMask string, txTimeout uint32, txConflictRetryNum int64, txConflictRetryInterval int64) (err error) {
+	dpReadOnlyWhenVolFull bool, txMask string, txTimeout uint32, txConflictRetryNum int64, txConflictRetryInterval int64, optEnableQuota string) (err error) {
 	var request = newAPIRequest(http.MethodGet, proto.AdminCreateVol)
 	request.addParam("name", volName)
 	request.addParam("owner", owner)
@@ -371,6 +377,7 @@ func (api *AdminAPI) CreateVolName(volName, owner string, capacity uint64, cross
 	request.addParam("cacheLowWater", strconv.Itoa(cacheLowWater))
 	request.addParam("cacheLRUInterval", strconv.Itoa(cacheLRUInterval))
 	request.addParam("dpReadOnlyWhenVolFull", strconv.FormatBool(dpReadOnlyWhenVolFull))
+	request.addParam("enableQuota", optEnableQuota)
 	if txMask != "" {
 		request.addParam("enableTxMask", txMask)
 	}
@@ -517,6 +524,15 @@ func (api *AdminAPI) ListVols(keywords string) (volsInfo []*proto.VolInfo, err e
 func (api *AdminAPI) IsFreezeCluster(isFreeze bool) (err error) {
 	var request = newAPIRequest(http.MethodGet, proto.AdminClusterFreeze)
 	request.addParam("enable", strconv.FormatBool(isFreeze))
+	if _, err = api.mc.serveRequest(request); err != nil {
+		return
+	}
+	return
+}
+
+func (api *AdminAPI) SetForbidMpDecommission(disable bool) (err error) {
+	var request = newAPIRequest(http.MethodGet, proto.AdminClusterForbidMpDecommission)
+	request.addParam("enable", strconv.FormatBool(disable))
 	if _, err = api.mc.serveRequest(request); err != nil {
 		return
 	}

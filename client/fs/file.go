@@ -97,7 +97,6 @@ func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64, filename st
 			fReader = blobstore.NewReader(clientConf)
 		case syscall.O_WRONLY:
 			fWriter = blobstore.NewWriter(clientConf)
-
 		case syscall.O_RDWR:
 			fReader = blobstore.NewReader(clientConf)
 			fWriter = blobstore.NewWriter(clientConf)
@@ -108,7 +107,7 @@ func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64, filename st
 	return &File{super: s, info: i, parentIno: pino, name: filename}
 }
 
-//get file parentPath
+// get file parentPath
 func (f *File) getParentPath() string {
 	filepath := ""
 	if f.parentIno == f.super.rootIno {
@@ -255,15 +254,20 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 			FileSize:        uint64(fileSize),
 			CacheThreshold:  f.super.CacheThreshold,
 		}
-
+		f.fWriter.FreeCache()
 		switch req.Flags & 0x0f {
 		case syscall.O_RDONLY:
 			f.fReader = blobstore.NewReader(clientConf)
+			f.fWriter = nil
 		case syscall.O_WRONLY:
 			f.fWriter = blobstore.NewWriter(clientConf)
+			f.fReader = nil
 		case syscall.O_RDWR:
 			f.fReader = blobstore.NewReader(clientConf)
 			f.fWriter = blobstore.NewWriter(clientConf)
+		default:
+			f.fWriter = blobstore.NewWriter(clientConf)
+			f.fReader = nil
 		}
 		log.LogDebugf("TRACE file open,ino(%v)  req.Flags(%v) reader(%v)  writer(%v)", ino, req.Flags, f.fReader, f.fWriter)
 	}
@@ -414,6 +418,9 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	}()
 
 	checkFunc := func() error {
+		if !f.super.mw.EnableQuota {
+			return nil
+		}
 		if ok := f.super.ec.UidIsLimited(req.Uid); ok {
 			return ParseError(syscall.ENOSPC)
 		}

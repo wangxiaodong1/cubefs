@@ -365,13 +365,14 @@ func (mw *MetaWrapper) parseRespWithAuth(body []byte) (resp proto.MasterAPIAcces
 }
 
 func (mw *MetaWrapper) updateQuotaInfoTick() {
+	mw.updateQuotaInfo()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			mw.UpdateQuotaInfo()
+			mw.updateQuotaInfo()
 		case <-mw.closeCh:
 			return
 		}
@@ -379,10 +380,20 @@ func (mw *MetaWrapper) updateQuotaInfoTick() {
 	}
 }
 
-func (mw *MetaWrapper) UpdateQuotaInfo() {
+func (mw *MetaWrapper) updateQuotaInfo() {
+	var volumeInfo *proto.SimpleVolView
+	volumeInfo, err := mw.mc.AdminAPI().GetVolumeSimpleInfo(mw.volname)
+	if err != nil {
+		return
+	}
+	mw.EnableQuota = volumeInfo.EnableQuota
+	if !mw.EnableQuota {
+		return
+	}
+
 	quotaInfos, err := mw.mc.AdminAPI().ListQuota(mw.volname)
 	if err != nil {
-		log.LogWarnf("UpdateQuotaInfo get quota info fail: vol [%v] err [%v]", mw.volname, err)
+		log.LogWarnf("updateQuotaInfo get quota info fail: vol [%v] err [%v]", mw.volname, err)
 		return
 	}
 	mw.QuotaLock.Lock()
@@ -390,7 +401,7 @@ func (mw *MetaWrapper) UpdateQuotaInfo() {
 	mw.QuotaInfoMap = make(map[uint32]*proto.QuotaInfo)
 	for _, info := range quotaInfos {
 		mw.QuotaInfoMap[info.QuotaId] = info
-		log.LogDebugf("UpdateQuotaInfo quotaInfo [%v]", info)
+		log.LogDebugf("updateQuotaInfo quotaInfo [%v]", info)
 	}
 }
 
@@ -419,4 +430,33 @@ func (mw *MetaWrapper) GetQuotaFullPaths() (fullPaths []string) {
 		}
 	}
 	return fullPaths
+}
+
+func (mw *MetaWrapper) IsQuotaLimitedById(inodeId uint64, size bool, files bool) bool {
+	mp := mw.getPartitionByInode(inodeId)
+	if mp == nil {
+		log.LogErrorf("IsQuotaLimitedById: inodeId(%v)", inodeId)
+		return true
+	}
+	quotaInfos, err := mw.getInodeQuota(mp, inodeId)
+	if err != nil {
+		log.LogErrorf("IsQuotaLimitedById: get parent quota fail, inodeId(%v) err(%v)", inodeId, err)
+		return true
+	}
+	for quotaId := range quotaInfos {
+		if info, isFind := mw.QuotaInfoMap[quotaId]; isFind {
+			if size && info.LimitedInfo.LimitedBytes {
+				log.LogDebugf("IsQuotaLimitedById quotaId [%v]", quotaId)
+				return true
+			}
+
+			if files && info.LimitedInfo.LimitedFiles {
+				log.LogDebugf("IsQuotaLimitedById quotaId [%v]", quotaId)
+				return true
+			}
+		}
+		log.LogDebugf("IsQuotaLimitedById false quota [%v]", quotaId)
+	}
+
+	return false
 }

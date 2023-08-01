@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/cubefs/cubefs/proto"
@@ -105,7 +104,66 @@ func (mw *MetaWrapper) txIcreate(tx *Transaction, mp *MetaPartition, mode, uid, 
 	return status, resp.Info, nil
 }
 
-func (mw *MetaWrapper) icreate(mp *MetaPartition, mode, uid, gid uint32, target []byte, quotaIds []uint32) (status int,
+func (mw *MetaWrapper) quotaIcreate(mp *MetaPartition, mode, uid, gid uint32, target []byte, quotaIds []uint32) (status int,
+	info *proto.InodeInfo, err error) {
+	bgTime := stat.BeginStat()
+	defer func() {
+		stat.EndStat("icreate", err, bgTime, 1)
+	}()
+
+	req := &proto.QuotaCreateInodeRequest{
+		VolName:     mw.volname,
+		PartitionID: mp.PartitionID,
+		Mode:        mode,
+		Uid:         uid,
+		Gid:         gid,
+		Target:      target,
+		QuotaIds:    quotaIds,
+	}
+
+	packet := proto.NewPacketReqID()
+	packet.Opcode = proto.OpQuotaCreateInode
+	packet.PartitionID = mp.PartitionID
+	err = packet.MarshalData(req)
+	if err != nil {
+		log.LogErrorf("quotaIcreate: err(%v)", err)
+		return
+	}
+
+	metric := exporter.NewTPCnt(packet.GetOpMsg())
+	defer func() {
+		metric.SetWithLabels(err, map[string]string{exporter.Vol: mw.volname})
+	}()
+
+	packet, err = mw.sendToMetaPartition(mp, packet)
+	if err != nil {
+		log.LogErrorf("quotaIcreate: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
+		return
+	}
+
+	status = parseStatus(packet.ResultCode)
+	if status != statusOK {
+		err = errors.New(packet.GetResultMsg())
+		log.LogErrorf("quotaIcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
+		return
+	}
+
+	resp := new(proto.CreateInodeResponse)
+	err = packet.UnmarshalData(resp)
+	if err != nil {
+		log.LogErrorf("quotaIcreate: packet(%v) mp(%v) err(%v) PacketData(%v)", packet, mp, err, string(packet.Data))
+		return
+	}
+	if resp.Info == nil {
+		err = errors.New(fmt.Sprintf("quotaIcreate: info is nil, packet(%v) mp(%v) req(%v) PacketData(%v)", packet, mp, *req, string(packet.Data)))
+		log.LogWarn(err)
+		return
+	}
+	log.LogDebugf("quotaIcreate: packet(%v) mp(%v) req(%v) info(%v)", packet, mp, *req, resp.Info)
+	return statusOK, resp.Info, nil
+}
+
+func (mw *MetaWrapper) icreate(mp *MetaPartition, mode, uid, gid uint32, target []byte) (status int,
 	info *proto.InodeInfo, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
@@ -119,7 +177,6 @@ func (mw *MetaWrapper) icreate(mp *MetaPartition, mode, uid, gid uint32, target 
 		Uid:         uid,
 		Gid:         gid,
 		Target:      target,
-		QuotaIds:    quotaIds,
 	}
 
 	packet := proto.NewPacketReqID()
@@ -164,16 +221,70 @@ func (mw *MetaWrapper) icreate(mp *MetaPartition, mode, uid, gid uint32, target 
 	return statusOK, resp.Info, nil
 }
 
+func (mw *MetaWrapper) SendTxPack(req proto.TxPack, resp interface{}, Opcode uint8, mp *MetaPartition,
+	checkStatusFunc func(int, *proto.Packet) error) (status int, err error, packet *proto.Packet) {
+
+	retryNum := int64(0)
+	for {
+		packet = proto.NewPacketReqID()
+		packet.Opcode = Opcode
+		packet.PartitionID = mp.PartitionID
+		err = packet.MarshalData(req)
+		if err != nil {
+			log.LogErrorf("SendTxPack reqType(%v) txInfo(%v) : err(%v)", packet.GetOpMsg(), req.GetInfo(), err)
+			return
+		}
+		packet, err = mw.sendToMetaPartition(mp, packet)
+		if err != nil {
+			log.LogErrorf("SendTxPack: packet(%v) mp(%v) reqType(%v) txInfo(%v) err(%v)",
+				packet, mp, packet.GetOpMsg(), req.GetInfo(), err)
+			return
+		}
+
+		status = parseStatus(packet.ResultCode)
+		if status != statusTxConflict {
+			break
+		}
+
+		log.LogWarnf("SendTxPack: packet(%v) mp(%v) reqType(%v) result(%v), tx conflict retry: %v txInfo(%v)",
+			packet, mp, packet.GetOpMsg(), packet.GetResultMsg(), retryNum, req.GetInfo())
+		retryNum++
+		if retryNum > mw.TxConflictRetryNum {
+			log.LogErrorf("SendTxPack: packet(%v) mp(%v) reqType(%v) result(%v), tx conflict retry: %v txInfo(%v)",
+				packet, mp, packet.GetOpMsg(), packet.GetResultMsg(), retryNum, req.GetInfo())
+			break
+		}
+		time.Sleep(time.Duration(mw.TxConflictRetryInterval) * time.Millisecond)
+	}
+	if checkStatusFunc != nil {
+		if err = checkStatusFunc(status, packet); err != nil {
+			log.LogErrorf("SendTxPack: packet(%v) mp(%v) req(%v) txInfo(%v) result(%v) err(%v)",
+				packet, mp, packet.GetOpMsg(), req.GetInfo(), packet.GetResultMsg(), err)
+			return
+		}
+	} else {
+		if status != statusOK {
+			err = errors.New(packet.GetResultMsg())
+			log.LogErrorf("SendTxPack: packet(%v) mp(%v) req(%v) txInfo(%v) result(%v)",
+				packet, mp, packet.GetOpMsg(), req.GetInfo(), packet.GetResultMsg())
+			return
+		}
+	}
+
+	err = packet.UnmarshalData(resp)
+	if err != nil {
+		log.LogErrorf("txDcreate: packet(%v) mp(%v) txInfo(%v) err(%v) PacketData(%v)",
+			packet, mp, req.GetInfo(), err, string(packet.Data))
+		return
+	}
+	return
+}
+
 func (mw *MetaWrapper) txIunlink(tx *Transaction, mp *MetaPartition, inode uint64) (status int, info *proto.InodeInfo, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("txIunlink", err, bgTime, 1)
 	}()
-
-	/*status, err = tx.OnStart()
-	if status != statusOK || err != nil {
-		return
-	}*/
 
 	req := &proto.TxUnlinkInodeRequest{
 		VolName:     mw.volname,
@@ -192,47 +303,12 @@ func (mw *MetaWrapper) txIunlink(tx *Transaction, mp *MetaPartition, inode uint6
 	}()
 
 	var packet *proto.Packet
-	retryNum := int64(0)
-	for {
-		packet = proto.NewPacketReqID()
-		packet.Opcode = proto.OpMetaTxUnlinkInode
-		packet.PartitionID = mp.PartitionID
-		err = packet.MarshalData(req)
-		if err != nil {
-			log.LogErrorf("txIunlink: ino(%v) err(%v)", inode, err)
-			return
-		}
-		packet, err = mw.sendToMetaPartition(mp, packet)
-		if err != nil {
-			log.LogErrorf("txIunlink: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
-			return
-		}
-
-		status = parseStatus(packet.ResultCode)
-		if status != statusTxConflict {
-			break
-		}
-		retryNum++
-		if retryNum <= mw.TxConflictRetryNum {
-			log.LogWarnf("txIunlink: packet(%v) mp(%v) req(%v) result(%v), tx conflict retry: %v",
-				packet, mp, *req, packet.GetResultMsg(), retryNum)
-			time.Sleep(time.Duration(mw.TxConflictRetryInterval) * time.Millisecond)
-		}
-
-	}
-
-	if status != statusOK {
-		err = errors.New(packet.GetResultMsg())
+	if status, err, packet = mw.SendTxPack(req, resp, proto.OpMetaTxUnlinkInode, mp, nil); err != nil {
 		log.LogErrorf("txIunlink: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 		return
 	}
-	err = packet.UnmarshalData(resp)
-	if err != nil {
-		log.LogErrorf("txIunlink: packet(%v) mp(%v) req(%v) err(%v) PacketData(%v)", packet, mp, *req, err, string(packet.Data))
-		return
-	}
 	if resp.Info == nil || resp.TxInfo == nil {
-		err = errors.New(fmt.Sprintf("txIunlink: info is nil, packet(%v) mp(%v) req(%v) PacketData(%v)", packet, mp, *req, string(packet.Data)))
+		err = errors.New(fmt.Sprintf("txIunlink: TxInfo is nil, packet(%v) mp(%v) req(%v) PacketData(%v)", packet, mp, *req, string(packet.Data)))
 		log.LogWarn(err)
 		return
 	}
@@ -246,10 +322,18 @@ func (mw *MetaWrapper) iunlink(mp *MetaPartition, inode uint64) (status int, inf
 		stat.EndStat("iunlink", err, bgTime, 1)
 	}()
 
+	//use uniq id to dedup request
+	status, uniqID, err := mw.consumeUniqID(mp)
+	if err != nil || status != statusOK {
+		err = statusToErrno(status)
+		return
+	}
+
 	req := &proto.UnlinkInodeRequest{
 		VolName:     mw.volname,
 		PartitionID: mp.PartitionID,
 		Inode:       inode,
+		UniqID:      uniqID,
 	}
 
 	packet := proto.NewPacketReqID()
@@ -382,11 +466,6 @@ func (mw *MetaWrapper) txDcreate(tx *Transaction, mp *MetaPartition, parentID ui
 		stat.EndStat("txDcreate", err, bgTime, 1)
 	}()
 
-	/*status, err = tx.OnStart()
-	if status != statusOK || err != nil {
-		return
-	}*/
-
 	if parentID == inode {
 		return statusExist, nil
 	}
@@ -412,46 +491,20 @@ func (mw *MetaWrapper) txDcreate(tx *Transaction, mp *MetaPartition, parentID ui
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: mw.volname})
 	}()
 
-	var packet *proto.Packet
-	retryNum := int64(0)
-	for {
-		packet = proto.NewPacketReqID()
-		packet.Opcode = proto.OpMetaTxCreateDentry
-		packet.PartitionID = mp.PartitionID
-		err = packet.MarshalData(req)
-		if err != nil {
-			log.LogErrorf("txDcreate: req(%v) err(%v)", *req, err)
+	statusCheckFunc := func(status int, packet *proto.Packet) (err error) {
+		if (status != statusOK) && (status != statusExist) {
+			err = errors.New(packet.GetResultMsg())
+			log.LogErrorf("txDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 			return
+		} else if status == statusExist {
+			log.LogWarnf("txDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 		}
-		packet, err = mw.sendToMetaPartition(mp, packet)
-		if err != nil {
-			log.LogErrorf("txDcreate: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
-			return
-		}
-
-		status = parseStatus(packet.ResultCode)
-		if status != statusTxConflict {
-			break
-		}
-		retryNum++
-		if retryNum <= mw.TxConflictRetryNum {
-			log.LogWarnf("txDcreate: packet(%v) mp(%v) req(%v) result(%v), tx conflict retry: %v",
-				packet, mp, *req, packet.GetResultMsg(), retryNum)
-			time.Sleep(time.Duration(mw.TxConflictRetryInterval) * time.Millisecond)
-		}
-	}
-
-	if (status != statusOK) && (status != statusExist) {
-		err = errors.New(packet.GetResultMsg())
-		log.LogErrorf("txDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 		return
-	} else if status == statusExist {
-		log.LogWarnf("txDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 	}
 
-	err = packet.UnmarshalData(resp)
-	if err != nil {
-		log.LogErrorf("txDcreate: packet(%v) mp(%v) err(%v) PacketData(%v)", packet, mp, err, string(packet.Data))
+	var packet *proto.Packet
+	if status, err, packet = mw.SendTxPack(req, resp, proto.OpMetaTxCreateDentry, mp, statusCheckFunc); err != nil {
+		log.LogErrorf("txDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 		return
 	}
 
@@ -460,13 +513,63 @@ func (mw *MetaWrapper) txDcreate(tx *Transaction, mp *MetaPartition, parentID ui
 		log.LogWarn(err)
 		return
 	}
-
 	log.LogDebugf("txDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 	return
 }
 
-func (mw *MetaWrapper) dcreate(mp *MetaPartition, parentID uint64, name string, inode uint64, mode uint32,
+func (mw *MetaWrapper) quotaDcreate(mp *MetaPartition, parentID uint64, name string, inode uint64, mode uint32,
 	quotaIds []uint32) (status int, err error) {
+	bgTime := stat.BeginStat()
+	defer func() {
+		stat.EndStat("dcreate", err, bgTime, 1)
+	}()
+
+	if parentID == inode {
+		return statusExist, nil
+	}
+
+	req := &proto.QuotaCreateDentryRequest{
+		VolName:     mw.volname,
+		PartitionID: mp.PartitionID,
+		ParentID:    parentID,
+		Inode:       inode,
+		Name:        name,
+		Mode:        mode,
+		QuotaIds:    quotaIds,
+	}
+
+	packet := proto.NewPacketReqID()
+	packet.Opcode = proto.OpQuotaCreateDentry
+	packet.PartitionID = mp.PartitionID
+	err = packet.MarshalData(req)
+	if err != nil {
+		log.LogErrorf("quotaDcreate: req(%v) err(%v)", *req, err)
+		return
+	}
+
+	metric := exporter.NewTPCnt(packet.GetOpMsg())
+	defer func() {
+		metric.SetWithLabels(err, map[string]string{exporter.Vol: mw.volname})
+	}()
+
+	packet, err = mw.sendToMetaPartition(mp, packet)
+	if err != nil {
+		log.LogErrorf("quotaDcreate: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
+		return
+	}
+
+	status = parseStatus(packet.ResultCode)
+	if (status != statusOK) && (status != statusExist) {
+		err = errors.New(packet.GetResultMsg())
+		log.LogErrorf("quotaDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
+	} else if status == statusExist {
+		log.LogWarnf("quotaDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
+	}
+	log.LogDebugf("quotaDcreate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
+	return
+}
+
+func (mw *MetaWrapper) dcreate(mp *MetaPartition, parentID uint64, name string, inode uint64, mode uint32) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("dcreate", err, bgTime, 1)
@@ -483,7 +586,6 @@ func (mw *MetaWrapper) dcreate(mp *MetaPartition, parentID uint64, name string, 
 		Inode:       inode,
 		Name:        name,
 		Mode:        mode,
-		QuotaIds:    quotaIds,
 	}
 
 	packet := proto.NewPacketReqID()
@@ -523,11 +625,6 @@ func (mw *MetaWrapper) txDupdate(tx *Transaction, mp *MetaPartition, parentID ui
 		stat.EndStat("txDupdate", err, bgTime, 1)
 	}()
 
-	/*status, err = tx.OnStart()
-	if status != statusOK || err != nil {
-		return
-	}*/
-
 	if parentID == newInode {
 		return statusExist, 0, nil
 	}
@@ -552,44 +649,8 @@ func (mw *MetaWrapper) txDupdate(tx *Transaction, mp *MetaPartition, parentID ui
 	}()
 
 	var packet *proto.Packet
-	retryNum := int64(0)
-	for {
-		packet = proto.NewPacketReqID()
-		packet.Opcode = proto.OpMetaTxUpdateDentry
-		packet.PartitionID = mp.PartitionID
-		err = packet.MarshalData(req)
-		if err != nil {
-			log.LogErrorf("txDupdate: req(%v) err(%v)", *req, err)
-			return
-		}
-		packet, err = mw.sendToMetaPartition(mp, packet)
-		if err != nil {
-			log.LogErrorf("txDupdate: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
-			return
-		}
-
-		status = parseStatus(packet.ResultCode)
-		if status != statusTxConflict {
-			break
-		}
-		retryNum++
-		if retryNum <= mw.TxConflictRetryNum {
-			log.LogWarnf("txDupdate: packet(%v) mp(%v) req(%v) result(%v), tx conflict retry: %v",
-				packet, mp, *req, packet.GetResultMsg(), retryNum)
-			time.Sleep(time.Duration(mw.TxConflictRetryInterval) * time.Millisecond)
-		}
-
-	}
-
-	if status != statusOK {
-		err = errors.New(packet.GetResultMsg())
+	if status, err, packet = mw.SendTxPack(req, resp, proto.OpMetaTxUpdateDentry, mp, nil); err != nil {
 		log.LogErrorf("txDupdate: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
-		return
-	}
-
-	err = packet.UnmarshalData(resp)
-	if err != nil {
-		log.LogErrorf("txDupdate: packet(%v) mp(%v) err(%v) PacketData(%v)", packet, mp, err, string(packet.Data))
 		return
 	}
 
@@ -664,11 +725,6 @@ func (mw *MetaWrapper) txDdelete(tx *Transaction, mp *MetaPartition, parentID ui
 		stat.EndStat("txDdelete", err, bgTime, 1)
 	}()
 
-	/*status, err = tx.OnStart()
-	if status != statusOK || err != nil {
-		return
-	}*/
-
 	req := &proto.TxDeleteDentryRequest{
 		VolName:     mw.volname,
 		PartitionID: mp.PartitionID,
@@ -688,43 +744,8 @@ func (mw *MetaWrapper) txDdelete(tx *Transaction, mp *MetaPartition, parentID ui
 	}()
 
 	var packet *proto.Packet
-	retryNum := int64(0)
-	for {
-		packet = proto.NewPacketReqID()
-		packet.Opcode = proto.OpMetaTxDeleteDentry
-		packet.PartitionID = mp.PartitionID
-		err = packet.MarshalData(req)
-		if err != nil {
-			log.LogErrorf("txDdelete: req(%v) err(%v)", *req, err)
-			return
-		}
-		packet, err = mw.sendToMetaPartition(mp, packet)
-		if err != nil {
-			log.LogErrorf("txDdelete: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
-			return
-		}
-		status = parseStatus(packet.ResultCode)
-		if status != statusTxConflict {
-			break
-		}
-		retryNum++
-		if retryNum <= mw.TxConflictRetryNum {
-			log.LogWarnf("txDdelete: packet(%v) mp(%v) req(%v) result(%v), tx conflict retry: %v",
-				packet, mp, *req, packet.GetResultMsg(), retryNum)
-			time.Sleep(time.Duration(mw.TxConflictRetryInterval) * time.Millisecond)
-		}
-
-	}
-
-	if status != statusOK {
-		err = errors.New(packet.GetResultMsg())
+	if status, err, packet = mw.SendTxPack(req, resp, proto.OpMetaTxDeleteDentry, mp, nil); err != nil {
 		log.LogErrorf("txDdelete: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
-		return
-	}
-
-	err = packet.UnmarshalData(resp)
-	if err != nil {
-		log.LogErrorf("txDdelete: packet(%v) mp(%v) err(%v) PacketData(%v)", packet, mp, err, string(packet.Data))
 		return
 	}
 	if resp.TxInfo == nil {
@@ -1278,11 +1299,6 @@ func (mw *MetaWrapper) txIlink(tx *Transaction, mp *MetaPartition, inode uint64)
 		stat.EndStat("txIlink", err, bgTime, 1)
 	}()
 
-	/*status, err = tx.OnStart()
-	if status != statusOK || err != nil {
-		return
-	}*/
-
 	req := &proto.TxLinkInodeRequest{
 		VolName:     mw.volname,
 		PartitionID: mp.PartitionID,
@@ -1301,48 +1317,12 @@ func (mw *MetaWrapper) txIlink(tx *Transaction, mp *MetaPartition, inode uint64)
 	}()
 
 	var packet *proto.Packet
-	retryNum := int64(0)
-	for {
-		packet = proto.NewPacketReqID()
-		packet.Opcode = proto.OpMetaTxLinkInode
-		packet.PartitionID = mp.PartitionID
-		err = packet.MarshalData(req)
-		if err != nil {
-			log.LogErrorf("txIlink: req(%v) err(%v)", *req, err)
-			return
-		}
-		packet, err = mw.sendToMetaPartition(mp, packet)
-		if err != nil {
-			log.LogErrorf("txIlink: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
-			return
-		}
-
-		status = parseStatus(packet.ResultCode)
-		if status != statusTxConflict {
-			break
-		}
-		retryNum++
-		if retryNum <= mw.TxConflictRetryNum {
-			log.LogWarnf("txIlink: packet(%v) mp(%v) req(%v) result(%v), tx conflict retry: %v",
-				packet, mp, *req, packet.GetResultMsg(), retryNum)
-			time.Sleep(time.Duration(mw.TxConflictRetryInterval) * time.Millisecond)
-		}
-
-	}
-
-	if status != statusOK {
-		err = errors.New(packet.GetResultMsg())
+	if status, err, packet = mw.SendTxPack(req, resp, proto.OpMetaTxLinkInode, mp, nil); err != nil {
 		log.LogErrorf("txIlink: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 		return
 	}
-
-	err = packet.UnmarshalData(resp)
-	if err != nil {
-		log.LogErrorf("txIlink: packet(%v) mp(%v) err(%v) PacketData(%v)", packet, mp, err, string(packet.Data))
-		return
-	}
 	if resp.Info == nil || resp.TxInfo == nil {
-		err = errors.New(fmt.Sprintf("txIlink: info is nil, packet(%v) mp(%v) req(%v) PacketData(%v)", packet, mp, *req, string(packet.Data)))
+		err = errors.New(fmt.Sprintf("txIlink: TxInfo is nil, packet(%v) mp(%v) req(%v) PacketData(%v)", packet, mp, *req, string(packet.Data)))
 		log.LogWarn(err)
 		return
 	}
@@ -1356,10 +1336,18 @@ func (mw *MetaWrapper) ilink(mp *MetaPartition, inode uint64) (status int, info 
 		stat.EndStat("ilink", err, bgTime, 1)
 	}()
 
+	//use unique id to dedup request
+	status, uniqID, err := mw.consumeUniqID(mp)
+	if err != nil || status != statusOK {
+		err = statusToErrno(status)
+		return
+	}
+
 	req := &proto.LinkInodeRequest{
 		VolName:     mw.volname,
 		PartitionID: mp.PartitionID,
 		Inode:       inode,
+		UniqID:      uniqID,
 	}
 
 	packet := proto.NewPacketReqID()
@@ -2289,15 +2277,8 @@ func (mw *MetaWrapper) updateXAttrs(mp *MetaPartition, inode uint64, filesInc in
 	return nil
 }
 
-func (mw *MetaWrapper) batchSetInodeQuota(wg *sync.WaitGroup, mp *MetaPartition, inodes []uint64, quotaId uint32,
-	currentGoroutineNum *int32, newGoroutine bool, IsRoot bool) {
-	defer func() {
-		if newGoroutine {
-			atomic.AddInt32(currentGoroutineNum, -1)
-			wg.Done()
-		}
-	}()
-	var err error
+func (mw *MetaWrapper) batchSetInodeQuota(mp *MetaPartition, inodes []uint64, quotaId uint32,
+	IsRoot bool) (resp *proto.BatchSetMetaserverQuotaResponse, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("batchSetInodeQuota", err, bgTime, 1)
@@ -2335,25 +2316,22 @@ func (mw *MetaWrapper) batchSetInodeQuota(wg *sync.WaitGroup, mp *MetaPartition,
 		log.LogErrorf("batchSetInodeQuota: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 		return
 	}
-	log.LogInfof("batchSetInodeQuota inodes [%v] quota [%v] cur [%v] newGoroutine [%v] success.",
-		inodes, quotaId, *currentGoroutineNum, newGoroutine)
+	resp = new(proto.BatchSetMetaserverQuotaResponse)
+	resp.InodeRes = make(map[uint64]uint8, 0)
+	if err = packet.UnmarshalData(resp); err != nil {
+		log.LogErrorf("batchSetInodeQuota: packet(%v) mp(%v) req(%v) err(%v) PacketData(%v)", packet, mp, *req, err, string(packet.Data))
+		return
+	}
+	log.LogInfof("batchSetInodeQuota inodes [%v] quota [%v] resp [%v] success.", inodes, quotaId, resp)
 	return
 }
 
-func (mw *MetaWrapper) batchDeleteInodeQuota(wg *sync.WaitGroup, mp *MetaPartition, inodes []uint64, quotaId uint32,
-	currentGoroutineNum *int32, newGoroutine bool) {
-	defer func() {
-		if newGoroutine {
-			atomic.AddInt32(currentGoroutineNum, -1)
-			wg.Done()
-		}
-	}()
-	var err error
+func (mw *MetaWrapper) batchDeleteInodeQuota(mp *MetaPartition, inodes []uint64,
+	quotaId uint32) (resp *proto.BatchDeleteMetaserverQuotaResponse, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("batchDeleteInodeQuota", err, bgTime, 1)
 	}()
-	log.LogDebugf("batchDeleteInodeQuota mp [%v] inodes [%v]", mp.PartitionID, inodes)
 	req := &proto.BatchDeleteMetaserverQuotaReuqest{
 		PartitionId: mp.PartitionID,
 		Inodes:      inodes,
@@ -2385,8 +2363,14 @@ func (mw *MetaWrapper) batchDeleteInodeQuota(wg *sync.WaitGroup, mp *MetaPartiti
 		log.LogErrorf("batchDeleteInodeQuota: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 		return
 	}
-	log.LogInfof("batchDeleteInodeQuota inodes [%v] quota [%v] cur [%v] newGoroutine [%v] success.",
-		inodes, quotaId, *currentGoroutineNum, newGoroutine)
+	resp = new(proto.BatchDeleteMetaserverQuotaResponse)
+	resp.InodeRes = make(map[uint64]uint8, 0)
+	if err = packet.UnmarshalData(resp); err != nil {
+		log.LogErrorf("batchSetInodeQuota: packet(%v) mp(%v) req(%v) err(%v) PacketData(%v)", packet, mp, *req, err, string(packet.Data))
+		return
+	}
+	log.LogInfof("batchDeleteInodeQuota inodes [%v] quota [%v] resp [%v] success.",
+		inodes, quotaId, resp)
 	return
 }
 
@@ -2441,33 +2425,65 @@ func (mw *MetaWrapper) getInodeQuota(mp *MetaPartition, inode uint64) (quotaInfo
 
 func (mw *MetaWrapper) applyQuota(parentIno uint64, quotaId uint32, totalInodeCount *uint64, curInodeCount *uint64, inodes *[]uint64,
 	maxInodes uint64, first bool) (err error) {
-	entries, err := mw.ReadDir_ll(parentIno)
-	if err != nil {
-		return err
-	}
-
 	if first {
 		var rootInodes []uint64
+		var ret map[uint64]uint8
 		rootInodes = append(rootInodes, parentIno)
-		mw.BatchSetInodeQuota_ll(rootInodes, quotaId, true)
-		*totalInodeCount = *totalInodeCount + 1
-	}
-
-	for _, entry := range entries {
-		*inodes = append(*inodes, entry.Inode)
-		*curInodeCount = *curInodeCount + 1
-		*totalInodeCount = *totalInodeCount + 1
-		if *curInodeCount >= maxInodes {
-			mw.BatchSetInodeQuota_ll(*inodes, quotaId, false)
-			*curInodeCount = 0
-			*inodes = (*inodes)[:0]
+		ret, err = mw.BatchSetInodeQuota_ll(rootInodes, quotaId, true)
+		if err != nil {
+			return
 		}
-		if proto.IsDir(entry.Type) {
-			err = mw.applyQuota(entry.Inode, quotaId, totalInodeCount, curInodeCount, inodes, maxInodes, false)
-			if err != nil {
-				return err
+		if status, ok := ret[parentIno]; ok {
+			if status != proto.OpOk {
+				if status == proto.OpNotExistErr {
+					err = fmt.Errorf("apply inode %v is not exist.", parentIno)
+				} else {
+					err = fmt.Errorf("apply inode %v failed, status: %v.", parentIno, status)
+				}
+
+				return
 			}
 		}
+		*totalInodeCount = *totalInodeCount + 1
+	}
+	var defaultReaddirLimit uint64 = 1024
+	var noMore = false
+	var from = ""
+	for !noMore {
+		entries, err := mw.ReadDirLimit_ll(parentIno, from, defaultReaddirLimit)
+		if err != nil {
+			return err
+		}
+		entryNum := uint64(len(entries))
+		if entryNum == 0 {
+			break
+		}
+
+		if entryNum < defaultReaddirLimit {
+			noMore = true
+		}
+
+		if from != "" {
+			entries = entries[1:]
+		}
+
+		for _, entry := range entries {
+			*inodes = append(*inodes, entry.Inode)
+			*curInodeCount = *curInodeCount + 1
+			*totalInodeCount = *totalInodeCount + 1
+			if *curInodeCount >= maxInodes {
+				mw.BatchSetInodeQuota_ll(*inodes, quotaId, false)
+				*curInodeCount = 0
+				*inodes = (*inodes)[:0]
+			}
+			if proto.IsDir(entry.Type) {
+				err = mw.applyQuota(entry.Inode, quotaId, totalInodeCount, curInodeCount, inodes, maxInodes, false)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		from = entries[len(entries)-1].Name
 	}
 
 	if first && *curInodeCount > 0 {
@@ -2480,33 +2496,54 @@ func (mw *MetaWrapper) applyQuota(parentIno uint64, quotaId uint32, totalInodeCo
 
 func (mw *MetaWrapper) revokeQuota(parentIno uint64, quotaId uint32, totalInodeCount *uint64, curInodeCount *uint64, inodes *[]uint64,
 	maxInodes uint64, first bool) (err error) {
-	entries, err := mw.ReadDir_ll(parentIno)
-	if err != nil {
-		return err
-	}
-
 	if first {
 		var rootInodes []uint64
 		rootInodes = append(rootInodes, parentIno)
-		mw.BatchDeleteInodeQuota_ll(rootInodes, quotaId)
+		_, err = mw.BatchDeleteInodeQuota_ll(rootInodes, quotaId)
+		if err != nil {
+			return
+		}
 		*totalInodeCount = *totalInodeCount + 1
 	}
 
-	for _, entry := range entries {
-		*inodes = append(*inodes, entry.Inode)
-		*curInodeCount = *curInodeCount + 1
-		*totalInodeCount = *totalInodeCount + 1
-		if *curInodeCount >= maxInodes {
-			mw.BatchDeleteInodeQuota_ll(*inodes, quotaId)
-			*curInodeCount = 0
-			*inodes = (*inodes)[:0]
+	var defaultReaddirLimit uint64 = 1024
+	var noMore = false
+	var from = ""
+	for !noMore {
+		entries, err := mw.ReadDirLimit_ll(parentIno, from, defaultReaddirLimit)
+		if err != nil {
+			return err
 		}
-		if proto.IsDir(entry.Type) {
-			err = mw.revokeQuota(entry.Inode, quotaId, totalInodeCount, curInodeCount, inodes, maxInodes, false)
-			if err != nil {
-				return err
+		entryNum := uint64(len(entries))
+		if entryNum == 0 {
+			break
+		}
+
+		if entryNum < defaultReaddirLimit {
+			noMore = true
+		}
+
+		if from != "" {
+			entries = entries[1:]
+		}
+
+		for _, entry := range entries {
+			*inodes = append(*inodes, entry.Inode)
+			*curInodeCount = *curInodeCount + 1
+			*totalInodeCount = *totalInodeCount + 1
+			if *curInodeCount >= maxInodes {
+				mw.BatchDeleteInodeQuota_ll(*inodes, quotaId)
+				*curInodeCount = 0
+				*inodes = (*inodes)[:0]
+			}
+			if proto.IsDir(entry.Type) {
+				err = mw.revokeQuota(entry.Inode, quotaId, totalInodeCount, curInodeCount, inodes, maxInodes, false)
+				if err != nil {
+					return err
+				}
 			}
 		}
+		from = entries[len(entries)-1].Name
 	}
 
 	if first && *curInodeCount > 0 {
@@ -2514,5 +2551,69 @@ func (mw *MetaWrapper) revokeQuota(parentIno uint64, quotaId uint32, totalInodeC
 		*curInodeCount = 0
 		*inodes = (*inodes)[:0]
 	}
+	return
+}
+
+func (mw *MetaWrapper) consumeUniqID(mp *MetaPartition) (status int, uniqid uint64, err error) {
+	pid := mp.PartitionID
+	mw.uniqidRangeMutex.Lock()
+	defer mw.uniqidRangeMutex.Unlock()
+	id, ok := mw.uniqidRangeMap[pid]
+	if ok {
+		if id.cur < id.end {
+			status = statusOK
+			uniqid = id.cur
+			id.cur = id.cur + 1
+			return
+		}
+	}
+	status, start, err := mw.getUniqID(mp, maxUniqID)
+	if err != nil || status != statusOK {
+		return status, 0, err
+	}
+	uniqid = start
+	if ok {
+		id.cur = start + 1
+		id.end = start + maxUniqID
+	} else {
+		mw.uniqidRangeMap[pid] = &uniqidRange{start + 1, start + maxUniqID}
+	}
+	return
+}
+
+func (mw *MetaWrapper) getUniqID(mp *MetaPartition, num uint32) (status int, start uint64, err error) {
+	req := &proto.GetUniqIDRequest{
+		VolName:     mw.volname,
+		PartitionID: mp.PartitionID,
+		Num:         num,
+	}
+
+	packet := proto.NewPacketReqID()
+	packet.Opcode = proto.OpMetaGetUniqID
+	packet.PartitionID = mp.PartitionID
+	err = packet.MarshalData(req)
+	if err != nil {
+		return
+	}
+
+	packet, err = mw.sendToMetaPartition(mp, packet)
+	if err != nil {
+		log.LogErrorf("getUniqID: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
+		return
+	}
+
+	status = parseStatus(packet.ResultCode)
+	if status != statusOK {
+		log.LogErrorf("getUniqID: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
+		return
+	}
+
+	resp := new(proto.GetUniqIDResponse)
+	err = packet.UnmarshalData(resp)
+	if err != nil {
+		log.LogErrorf("getUniqID: packet(%v) mp(%v) err(%v) PacketData(%v)", packet, mp, err, string(packet.Data))
+		return
+	}
+	start = resp.Start
 	return
 }

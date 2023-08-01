@@ -39,7 +39,9 @@ type storeMsg struct {
 	//txRollbackInodes   map[uint64]*TxRollbackInode
 	txRbDentryTree *BTree
 	//txRollbackDentries map[string]*TxRollbackDentry
-
+	quotaRebuild bool
+	uidRebuild   bool
+	uniqChecker  *uniqChecker
 }
 
 func (mp *metaPartition) startSchedule(curIndex uint64) {
@@ -55,7 +57,7 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 		if err := mp.store(msg); err == nil {
 			// truncate raft log
 			if mp.raftPartition != nil {
-				log.LogWarnf("[startSchedule] partitionId=%d: nowAppID"+
+				log.LogWarnf("[startSchedule] start trunc, partitionId=%d: nowAppID"+
 					"=%d, applyID=%d", mp.config.PartitionId, curIndex,
 					msg.applyIndex)
 				mp.raftPartition.Truncate(curIndex)

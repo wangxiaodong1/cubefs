@@ -94,6 +94,7 @@ func (mp *metaPartition) fsmCreateDentry(dentry *Dentry,
 			return
 		}
 	}
+
 	if item, ok := mp.dentryTree.ReplaceOrInsert(dentry, false); !ok {
 		//do not allow directories and files to overwrite each
 		// other when renaming
@@ -256,6 +257,9 @@ func (mp *metaPartition) fsmUpdateDentry(dentry *Dentry) (
 			return
 		}
 		d := item.(*Dentry)
+		if dentry.Inode == d.Inode {
+			return
+		}
 		d.Inode, dentry.Inode = dentry.Inode, d.Inode
 		resp.Msg = dentry
 	})

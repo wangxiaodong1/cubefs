@@ -81,6 +81,7 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 		m.Range(func(id uint64, partition MetaPartition) bool {
 			m.checkFollowerRead(req.FLReadVols, partition)
 			partition.SetUidLimit(req.UidLimitInfo)
+			partition.SetTxInfo(req.TxInfo)
 			partition.setQuotaHbInfo(req.QuotaHbInfos)
 			mConf := partition.GetBaseConfig()
 			mpr := &proto.MetaPartitionReport{
@@ -117,9 +118,8 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 		adminTask.Request = nil
 		adminTask.Response = resp
 		m.respondToMaster(adminTask)
-		data, _ := json.Marshal(resp)
-		log.LogInfof("%s pkt %s, resp success req:%v; respAdminTask: %v, resp: %v, cost %s",
-			remoteAddr, p.String(), req, adminTask, string(data), time.Since(start).String())
+		log.LogInfof("%s pkt %s, resp success req:%v; respAdminTask: %v, cost %s",
+			remoteAddr, p.String(), req, adminTask, time.Since(start).String())
 	}()
 
 	return
@@ -185,6 +185,32 @@ func (m *metadataManager) opCreateInode(conn net.Conn, p *Packet,
 	// reply the operation result to the client through TCP
 	m.respondToClient(conn, p)
 	log.LogDebugf("%s [opCreateInode] req: %d - %v, resp: %v, body: %s",
+		remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
+	return
+}
+
+func (m *metadataManager) opQuotaCreateInode(conn net.Conn, p *Packet, remoteAddr string) (err error) {
+	req := &proto.QuotaCreateInodeRequest{}
+	if err = json.Unmarshal(p.Data, req); err != nil {
+		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+		m.respondToClient(conn, p)
+		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
+		return
+	}
+	mp, err := m.getPartition(req.PartitionID)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+		m.respondToClient(conn, p)
+		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
+		return
+	}
+	if !m.serveProxy(conn, mp, p) {
+		return
+	}
+	err = mp.QuotaCreateInode(req, p)
+	// reply the operation result to the client through TCP
+	m.respondToClient(conn, p)
+	log.LogDebugf("%s [opQuotaCreateInode] req: %d - %v, resp: %v, body: %s",
 		remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
 	return
 }
@@ -481,6 +507,33 @@ func (m *metadataManager) opCreateDentry(conn net.Conn, p *Packet,
 	m.respondToClient(conn, p)
 
 	log.LogDebugf("%s [opCreateDentry] req: %d - %v, resp: %v, body: %s",
+		remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
+	return
+}
+
+func (m *metadataManager) opQuotaCreateDentry(conn net.Conn, p *Packet,
+	remoteAddr string) (err error) {
+	req := &proto.QuotaCreateDentryRequest{}
+	if err = json.Unmarshal(p.Data, req); err != nil {
+		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+		m.respondToClient(conn, p)
+		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
+		return
+	}
+	mp, err := m.getPartition(req.PartitionID)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+		m.respondToClient(conn, p)
+		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
+		return
+	}
+	if !m.serveProxy(conn, mp, p) {
+		return
+	}
+	err = mp.QuotaCreateDentry(req, p)
+	m.respondToClient(conn, p)
+
+	log.LogDebugf("%s [opQuotaCreateDentry] req: %d - %v, resp: %v, body: %s",
 		remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
 	return
 }
@@ -1939,10 +1992,7 @@ func (m *metadataManager) opMetaBatchSetInodeQuota(conn net.Conn, p *Packet, rem
 	if !m.serveProxy(conn, mp, p) {
 		return
 	}
-	resp := &proto.BatchSetMetaserverQuotaResponse{
-		PartitionId: req.PartitionId,
-		QuotaId:     req.QuotaId,
-	}
+	resp := &proto.BatchSetMetaserverQuotaResponse{}
 	err = mp.batchSetInodeQuota(req, resp)
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
@@ -1980,10 +2030,7 @@ func (m *metadataManager) opMetaBatchDeleteInodeQuota(conn net.Conn, p *Packet, 
 	if !m.serveProxy(conn, mp, p) {
 		return
 	}
-	resp := &proto.BatchDeleteMetaserverQuotaResponse{
-		PartitionId: req.PartitionId,
-		QuotaId:     req.QuotaId,
-	}
+	resp := &proto.BatchDeleteMetaserverQuotaResponse{}
 	err = mp.batchDeleteInodeQuota(req, resp)
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
@@ -1998,7 +2045,6 @@ func (m *metadataManager) opMetaBatchDeleteInodeQuota(conn net.Conn, p *Packet, 
 	}
 	p.PacketOkWithBody(reply)
 	_ = m.respondToClient(conn, p)
-
 	log.LogInfof("[opMetaBatchDeleteInodeQuota] req [%v] resp [%v] success.", req, resp)
 	return err
 }
@@ -2027,4 +2073,38 @@ func (m *metadataManager) opMetaGetInodeQuota(conn net.Conn, p *Packet, remote s
 	_ = m.respondToClient(conn, p)
 	log.LogInfof("[opMetaGetInodeQuota] get inode [%v] quota success.", req.Inode)
 	return
+}
+
+func (m *metadataManager) opMetaGetUniqID(conn net.Conn, p *Packet,
+	remoteAddr string) (err error) {
+	req := &proto.GetUniqIDRequest{}
+	if err = json.Unmarshal(p.Data, req); err != nil {
+		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+		m.respondToClient(conn, p)
+		err = errors.NewErrorf("[%v] req: %v, resp: %v", p.GetOpMsgWithReqAndResult(), req, err.Error())
+		return
+	}
+
+	mp, err := m.getPartition(req.PartitionID)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+		m.respondToClient(conn, p)
+		err = errors.NewErrorf("[%v] req: %v, resp: %v", p.GetOpMsgWithReqAndResult(), req, err.Error())
+		return
+	}
+
+	if !m.serveProxy(conn, mp, p) {
+		return
+	}
+
+	err = mp.GetUniqID(p, req.Num)
+	m.respondToClient(conn, p)
+	if err != nil {
+		log.LogErrorf("%s [opMetaGetUniqID] %s, "+
+			"response to client: %s", remoteAddr, err.Error(), p.GetResultMsg())
+	}
+	log.LogDebugf("%s [opMetaGetUniqID] req: %d - %v, resp: %v, body: %s",
+		remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
+	return
+
 }

@@ -40,10 +40,12 @@ type VolVarargs struct {
 	dpReplicaNum            uint8
 	enablePosixAcl          bool
 	dpReadOnlyWhenVolFull   bool
+	enableQuota             bool
 	enableTransaction       uint8
 	txTimeout               int64
 	txConflictRetryNum      int64
 	txConflictRetryInterval int64
+	txOpLimit               int
 }
 
 // Vol represents a set of meta partitionMap and data partitionMap
@@ -83,6 +85,7 @@ type Vol struct {
 	txTimeout               int64
 	txConflictRetryNum      int64
 	txConflictRetryInterval int64
+	txOpLimit               int
 	zoneName                string
 	MetaPartitions          map[uint64]*MetaPartition `graphql:"-"`
 	mpsLock                 sync.RWMutex
@@ -102,6 +105,7 @@ type Vol struct {
 	uidSpaceManager         *UidSpaceManager
 	volLock                 sync.RWMutex
 	quotaManager            *MasterQuotaManager
+	enableQuota             bool
 }
 
 func newVol(vv volValue) (vol *Vol) {
@@ -130,10 +134,12 @@ func newVol(vv volValue) (vol *Vol) {
 	vol.defaultPriority = vv.DefaultPriority
 	vol.domainId = vv.DomainId
 	vol.enablePosixAcl = vv.EnablePosixAcl
+	vol.enableQuota = vv.EnableQuota
 	vol.enableTransaction = vv.EnableTransaction
 	vol.txTimeout = vv.TxTimeout
 	vol.txConflictRetryNum = vv.TxConflictRetryNum
 	vol.txConflictRetryInterval = vv.TxConflictRetryInterval
+	vol.txOpLimit = vv.TxOpLimit
 
 	vol.VolType = vv.VolType
 	vol.EbsBlkSize = vv.EbsBlkSize
@@ -361,9 +367,10 @@ func (vol *Vol) checkDataPartitions(c *Cluster) (cnt int) {
 		dp.checkMissingReplicas(c.Name, c.leaderInfo.addr, c.cfg.MissingDataPartitionInterval, c.cfg.IntervalToAlarmMissingDataPartition)
 		dp.checkReplicaNum(c, vol)
 
-		if time.Since(time.Unix(vol.createTime, 0).Add(time.Second*defaultIntervalToCheckHeartbeat*3)) < 0 {
+		if time.Now().Unix()-vol.createTime < defaultIntervalToCheckHeartbeat*3 {
 			dp.setReadWrite()
 		}
+
 		if dp.Status == proto.ReadWrite {
 			cnt++
 		}
@@ -1218,10 +1225,12 @@ func setVolFromArgs(args *VolVarargs, vol *Vol) {
 	vol.authenticate = args.authenticate
 	vol.enablePosixAcl = args.enablePosixAcl
 	vol.DpReadOnlyWhenVolFull = args.dpReadOnlyWhenVolFull
+	vol.enableQuota = args.enableQuota
 	vol.enableTransaction = args.enableTransaction
 	vol.txTimeout = args.txTimeout
 	vol.txConflictRetryNum = args.txConflictRetryNum
 	vol.txConflictRetryInterval = args.txConflictRetryInterval
+	vol.txOpLimit = args.txOpLimit
 	vol.dpReplicaNum = args.dpReplicaNum
 
 	if proto.IsCold(vol.VolType) {
@@ -1266,11 +1275,13 @@ func getVolVarargs(vol *Vol) *VolVarargs {
 		dpSelectorName:          vol.dpSelectorName,
 		dpSelectorParm:          vol.dpSelectorParm,
 		enablePosixAcl:          vol.enablePosixAcl,
+		enableQuota:             vol.enableQuota,
 		dpReplicaNum:            vol.dpReplicaNum,
 		enableTransaction:       vol.enableTransaction,
 		txTimeout:               vol.txTimeout,
 		txConflictRetryNum:      vol.txConflictRetryNum,
 		txConflictRetryInterval: vol.txConflictRetryInterval,
+		txOpLimit:               vol.txOpLimit,
 		coldArgs:                args,
 		dpReadOnlyWhenVolFull:   vol.DpReadOnlyWhenVolFull,
 	}

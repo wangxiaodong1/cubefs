@@ -291,7 +291,7 @@ func InitLog(dir, module string, level Level, rotate *LogRotate) (*Log, error) {
 			return nil, errors.New(dir + " is not a directory")
 		}
 	}
-	_ = os.Chmod(dir, 0766)
+	_ = os.Chmod(dir, 0755)
 	if rotate == nil {
 		rotate = NewLogRotate()
 		fs := syscall.Statfs_t{}
@@ -525,6 +525,9 @@ func LogInfof(format string, v ...interface{}) {
 }
 
 func EnableInfo() bool {
+	if gLog == nil {
+		return false
+	}
 	return InfoLevel&gLog.level == gLog.level
 }
 

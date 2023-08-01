@@ -52,6 +52,7 @@ type Cluster struct {
 	badPartitionMutex            sync.RWMutex // BadDataPartitionIds and BadMetaPartitionIds operate mutex
 	leaderInfo                   *LeaderInfo
 	cfg                          *clusterConfig
+	metaReady                    bool
 	retainLogs                   uint64
 	idAlloc                      *IDAllocator
 	t                            *topology
@@ -63,6 +64,7 @@ type Cluster struct {
 	BadDataPartitionIds          *sync.Map
 	BadMetaPartitionIds          *sync.Map
 	DisableAutoAllocate          bool
+	ForbidMpDecommission         bool
 	FaultDomain                  bool
 	needFaultDomain              bool // FaultDomain is true and normal zone aleady used up
 	fsm                          *MetadataFsm
@@ -146,8 +148,10 @@ func (mgr *followerReadManager) getVolumeDpView() {
 
 	for _, vv := range volViews {
 		if vv.Status == markDelete {
+			mgr.rwMutex.Lock()
 			mgr.lastUpdateTick[vv.Name] = time.Now()
 			mgr.status[vv.Name] = false
+			mgr.rwMutex.Unlock()
 			continue
 		}
 
@@ -241,7 +245,6 @@ func (mgr *followerReadManager) updateVolViewFromLeader(key string, view *proto.
 		log.LogErrorf("updateVolViewFromLeader. key %v checkViewContent failed status %v", key, mgr.status[key])
 		return
 	}
-	log.LogDebugf("action[updateVolViewFromLeader] volume %v be updated, value len %v", key, len(view.DataPartitions))
 
 	reply := newSuccessHTTPReply(view)
 	if body, err := json.Marshal(reply); err != nil {
@@ -260,7 +263,6 @@ func (mgr *followerReadManager) checkViewContent(volName string, view *proto.Dat
 	if !isUpdate && !mgr.needCheck {
 		return true
 	}
-	log.LogDebugf("volName %v do check content", volName)
 
 	if len(view.DataPartitions) == 0 {
 		return true
@@ -271,7 +273,6 @@ func (mgr *followerReadManager) checkViewContent(volName string, view *proto.Dat
 			log.LogErrorf("checkViewContent. dp id %v, leader %v, status %v", dp.PartitionID, dp.LeaderAddr, dp.Status)
 		}
 	}
-	log.LogDebugf("checkViewContent. volName %v dp cnt %v check pass", volName, len(view.DataPartitions))
 	return true
 }
 
@@ -514,7 +515,9 @@ func (c *Cluster) checkDataPartitions() {
 	for _, vol := range vols {
 		readWrites := vol.checkDataPartitions(c)
 		vol.dataPartitions.setReadWriteDataPartitions(readWrites, c.Name)
-		vol.dataPartitions.updateResponseCache(true, 0, vol.VolType)
+		if c.metaReady {
+			vol.dataPartitions.updateResponseCache(true, 0, vol.VolType)
+		}
 		msg := fmt.Sprintf("action[checkDataPartitions],vol[%v] can readWrite partitions:%v  ",
 			vol.Name, vol.dataPartitions.readableAndWritableCnt)
 		log.LogInfo(msg)
@@ -535,6 +538,9 @@ func (c *Cluster) doLoadDataPartitions() {
 	}()
 	vols := c.allVols()
 	for _, vol := range vols {
+		if vol.Status == markDelete {
+			continue
+		}
 		vol.loadDataPartition(c)
 	}
 }
@@ -623,14 +629,22 @@ func (c *Cluster) checkMetaNodeHeartbeat() {
 			if vol.FollowerRead {
 				hbReq.FLReadVols = append(hbReq.FLReadVols, vol.Name)
 			}
+
 			spaceInfo := vol.uidSpaceManager.getSpaceOp()
 			hbReq.UidLimitInfo = append(hbReq.UidLimitInfo, spaceInfo...)
+
 			if vol.quotaManager != nil {
 				quotaHbInfos := vol.quotaManager.getQuotaHbInfos()
 				if len(quotaHbInfos) != 0 {
 					hbReq.QuotaHbInfos = append(hbReq.QuotaHbInfos, quotaHbInfos...)
 				}
 			}
+
+			hbReq.TxInfo = append(hbReq.TxInfo, &proto.TxInfo{
+				Volume:     vol.Name,
+				Mask:       vol.enableTransaction,
+				OpLimitVal: vol.txOpLimit,
+			})
 		}
 		log.LogDebugf("checkMetaNodeHeartbeat start")
 		for _, info := range hbReq.QuotaHbInfos {
@@ -1257,7 +1271,9 @@ func (c *Cluster) createDataPartition(volName string, preload *DataPartitionPreL
 		partitionTTL int64
 	)
 
+	c.volMutex.RLock()
 	vol = c.vols[volName]
+	c.volMutex.RUnlock()
 
 	dpReplicaNum := vol.dpReplicaNum
 	zoneName := vol.zoneName
@@ -2605,6 +2621,11 @@ func (c *Cluster) getBadDataPartitionsView() (bpvs []badPartitionView) {
 func (c *Cluster) migrateMetaNode(srcAddr, targetAddr string, limit int) (err error) {
 	var toBeOfflineMps []*MetaPartition
 
+	if c.ForbidMpDecommission {
+		err = fmt.Errorf("cluster mataPartition decommission switch is disabled")
+		return
+	}
+
 	msg := fmt.Sprintf("action[migrateMetaNode],clusterID[%v] migrate from node[%v] to [%s] begin", c.Name, srcAddr, targetAddr)
 	log.LogWarn(msg)
 
@@ -2942,6 +2963,7 @@ func (c *Cluster) doCreateVol(req *createVolReq) (vol *Vol, err error) {
 		CreateTime:              createTime,
 		Description:             req.description,
 		EnablePosixAcl:          req.enablePosixAcl,
+		EnableQuota:             req.enableQuota,
 		EnableTransaction:       req.enableTransaction,
 		TxTimeout:               req.txTimeout,
 		TxConflictRetryNum:      req.txConflictRetryNum,
@@ -3236,9 +3258,9 @@ func (c *Cluster) getMetaPartitionCount() (count int) {
 	return count
 }
 
-func (c *Cluster) setClusterInfo(quota uint32) (err error) {
+func (c *Cluster) setClusterInfo(dirLimit uint32) (err error) {
 	oldLimit := c.cfg.DirChildrenNumLimit
-	atomic.StoreUint32(&c.cfg.DirChildrenNumLimit, quota)
+	atomic.StoreUint32(&c.cfg.DirChildrenNumLimit, dirLimit)
 	if err = c.syncPutCluster(); err != nil {
 		log.LogErrorf("action[setClusterInfo] err[%v]", err)
 		atomic.StoreUint32(&c.cfg.DirChildrenNumLimit, oldLimit)
@@ -3358,6 +3380,18 @@ func (c *Cluster) setDisableAutoAllocate(disableAutoAllocate bool) (err error) {
 	if err = c.syncPutCluster(); err != nil {
 		log.LogErrorf("action[setDisableAutoAllocate] err[%v]", err)
 		c.DisableAutoAllocate = oldFlag
+		err = proto.ErrPersistenceByRaft
+		return
+	}
+	return
+}
+
+func (c *Cluster) setForbidMpDecommission(isForbid bool) (err error) {
+	oldFlag := c.ForbidMpDecommission
+	c.ForbidMpDecommission = isForbid
+	if err = c.syncPutCluster(); err != nil {
+		log.LogErrorf("action[setForbidMpDecommission] err[%v]", err)
+		c.ForbidMpDecommission = oldFlag
 		err = proto.ErrPersistenceByRaft
 		return
 	}

@@ -113,41 +113,75 @@ func (mp *metaPartition) CreateInode(req *CreateInoReq, p *Packet) (err error) {
 	ino.Uid = req.Uid
 	ino.Gid = req.Gid
 	ino.LinkTarget = req.Target
-	if defaultQuotaSwitch {
-		for _, quotaId := range req.QuotaIds {
-			status = mp.mqMgr.IsOverQuota(false, true, quotaId)
-			if status != 0 {
-				err = errors.New("create inode is over quota")
+
+	val, err := ino.Marshal()
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return err
+	}
+	resp, err = mp.submit(opFSMCreateInode, val)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return err
+	}
+
+	if resp.(uint8) == proto.OpOk {
+		resp := &CreateInoResp{
+			Info: &proto.InodeInfo{},
+		}
+		if replyInfo(resp.Info, ino, make([]uint32, 0)) {
+			status = proto.OpOk
+			reply, err = json.Marshal(resp)
+			if err != nil {
+				status = proto.OpErr
 				reply = []byte(err.Error())
-				p.PacketErrorWithBody(status, reply)
-				return
 			}
 		}
-		qinode = &MetaQuotaInode{
-			inode:    ino,
-			quotaIds: req.QuotaIds,
+	}
+	p.PacketErrorWithBody(status, reply)
+	log.LogInfof("CreateInode req [%v] qinode [%v] success.", req, qinode)
+	return
+}
+
+func (mp *metaPartition) QuotaCreateInode(req *proto.QuotaCreateInodeRequest, p *Packet) (err error) {
+	var (
+		status = proto.OpNotExistErr
+		reply  []byte
+		resp   interface{}
+		qinode *MetaQuotaInode
+	)
+	inoID, err := mp.nextInodeID()
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpInodeFullErr, []byte(err.Error()))
+		return
+	}
+	ino := NewInode(inoID, req.Mode)
+	ino.Uid = req.Uid
+	ino.Gid = req.Gid
+	ino.LinkTarget = req.Target
+
+	for _, quotaId := range req.QuotaIds {
+		status = mp.mqMgr.IsOverQuota(false, true, quotaId)
+		if status != 0 {
+			err = errors.New("create inode is over quota")
+			reply = []byte(err.Error())
+			p.PacketErrorWithBody(status, reply)
+			return
 		}
-		val, err := qinode.Marshal()
-		if err != nil {
-			p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
-			return err
-		}
-		resp, err = mp.submit(opFSMCreateInodeQuota, val)
-		if err != nil {
-			p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
-			return err
-		}
-	} else {
-		val, err := ino.Marshal()
-		if err != nil {
-			p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
-			return err
-		}
-		resp, err = mp.submit(opFSMCreateInode, val)
-		if err != nil {
-			p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
-			return err
-		}
+	}
+	qinode = &MetaQuotaInode{
+		inode:    ino,
+		quotaIds: req.QuotaIds,
+	}
+	val, err := qinode.Marshal()
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return err
+	}
+	resp, err = mp.submit(opFSMCreateInodeQuota, val)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return err
 	}
 
 	if resp.(uint8) == proto.OpOk {
@@ -164,7 +198,7 @@ func (mp *metaPartition) CreateInode(req *CreateInoReq, p *Packet) (err error) {
 		}
 	}
 	p.PacketErrorWithBody(status, reply)
-	log.LogInfof("CreateInode req [%v] qinode [%v] success.", req, qinode)
+	log.LogInfof("QuotaCreateInode req [%v] qinode [%v] success.", req, qinode)
 	return
 }
 
@@ -225,13 +259,21 @@ func (mp *metaPartition) TxUnlinkInode(req *proto.TxUnlinkInodeRequest, p *Packe
 
 // DeleteInode deletes an inode.
 func (mp *metaPartition) UnlinkInode(req *UnlinkInoReq, p *Packet) (err error) {
-	ino := NewInode(req.Inode, 0)
-	val, err := ino.Marshal()
-	if err != nil {
-		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
-		return
+	var r interface{}
+	var val []byte
+	if req.UniqID > 0 {
+		val = InodeOnceUnlinkMarshal(req)
+		r, err = mp.submit(opFSMUnlinkInodeOnce, val)
+	} else {
+		ino := NewInode(req.Inode, 0)
+		val, err = ino.Marshal()
+		if err != nil {
+			p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+			return
+		}
+		r, err = mp.submit(opFSMUnlinkInode, val)
 	}
-	r, err := mp.submit(opFSMUnlinkInode, val)
+
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
 		return
@@ -307,15 +349,18 @@ func (mp *metaPartition) UnlinkInodeBatch(req *BatchUnlinkInoReq, p *Packet) (er
 // InodeGet executes the inodeGet command from the client.
 func (mp *metaPartition) InodeGet(req *InodeGetReq, p *Packet) (err error) {
 	var (
-		reply  []byte
-		status = proto.OpNotExistErr
+		reply    []byte
+		status   = proto.OpNotExistErr
+		quotaIds []uint32
 	)
-	quotaIds, err := mp.getInodeQuotaIds(req.Inode)
-	if err != nil {
-		status = proto.OpErr
-		reply = []byte(err.Error())
-		p.PacketErrorWithBody(status, reply)
-		return
+	if mp.mqMgr.EnableQuota() {
+		quotaIds, err = mp.getInodeQuotaIds(req.Inode)
+		if err != nil {
+			status = proto.OpErr
+			reply = []byte(err.Error())
+			p.PacketErrorWithBody(status, reply)
+			return
+		}
 	}
 	ino := NewInode(req.Inode, 0)
 	retMsg := mp.getInode(ino)
@@ -339,16 +384,18 @@ func (mp *metaPartition) InodeGet(req *InodeGetReq, p *Packet) (err error) {
 
 // InodeGetBatch executes the inodeBatchGet command from the client.
 func (mp *metaPartition) InodeGetBatch(req *InodeGetReqBatch, p *Packet) (err error) {
-	var quotaIds []uint32
 	resp := &proto.BatchInodeGetResponse{}
 	ino := NewInode(0, 0)
 	for _, inoId := range req.Inodes {
+		var quotaIds []uint32
 		ino.Inode = inoId
 		retMsg := mp.getInode(ino)
-		quotaIds, err = mp.getInodeQuotaIds(inoId)
-		if err != nil {
-			p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
-			return
+		if mp.mqMgr.EnableQuota() {
+			quotaIds, err = mp.getInodeQuotaIds(inoId)
+			if err != nil {
+				p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+				return
+			}
 		}
 		if retMsg.Status == proto.OpOk {
 			inoInfo := &proto.InodeInfo{}

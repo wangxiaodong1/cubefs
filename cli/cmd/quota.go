@@ -17,7 +17,6 @@ package cmd
 import (
 	"fmt"
 	"math"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,9 +35,9 @@ const (
 	cmdQuotaListUse       = "list [volname]"
 	cmdQuotaListShort     = "list volname all quota"
 	cmdQuotaUpdateUse     = "update [volname] [quotaId]"
-	cmdQuotaUpdateShort   = "update path quota"
+	cmdQuotaUpdateShort   = "update quota files or bytes by id"
 	cmdQuotaDeleteUse     = "delete [volname] [quotaId]"
-	cmdQUotaDeleteShort   = "delete path quota"
+	cmdQUotaDeleteShort   = "delete quota by id"
 	cmdQuotaGetInodeUse   = "getInode [volname] [inode]"
 	cmdQuotaGetInodeShort = "get inode quotaInfo"
 	cmdQuotaListAllUse    = "listAll"
@@ -100,7 +99,7 @@ func newQuotaCreateCmd(client *master.MasterClient) *cobra.Command {
 			fullPaths := strings.Split(fullPath, ",")
 			err = checkNestedDirectories(fullPaths)
 			if err != nil {
-				stdout("create quota failed, fullPaths %v has nested.\n", fullPaths)
+				stdout("create quota failed, fullPaths %v error %v.\n", fullPaths, err)
 				return
 			}
 			if len(fullPaths) > 5 {
@@ -112,10 +111,6 @@ func newQuotaCreateCmd(client *master.MasterClient) *cobra.Command {
 				var quotaPathInfo proto.QuotaPathInfo
 				quotaPathInfo.FullPath = path
 
-				if strings.Count(path, "/") != 1 {
-					stdout("create quota failed, path %v does not has only one / \n", path)
-					return
-				}
 				if !strings.HasPrefix(path, "/") {
 					stdout("create quota failed, path %v does not start with / \n", path)
 					return
@@ -257,11 +252,11 @@ func newQuotaDelete(client *master.MasterClient) *cobra.Command {
 			var err error
 			if !optYes {
 				stdout("Before deleting the quota, please confirm that the quota of the inode in the subdirectory has been cleared\n")
-				stdout("ensure that the quota list %v usedFiles is displayed as 1\n", volName)
+				stdout("ensure that the quota list %v usedFiles is displayed as 0\n", volName)
 				stdout("\nConfirm (yes/no)[yes]:")
 				var userConfirm string
 				_, _ = fmt.Scanln(&userConfirm)
-				if userConfirm != "yes" && len(userConfirm) != 0 {
+				if userConfirm != "yes" {
 					stdout("Abort by user.\n")
 					return
 				}
@@ -347,7 +342,8 @@ func newQuotaApplyCmd(client *master.MasterClient) *cobra.Command {
 			for _, pathInfo := range quotaInfo.PathInfos {
 				inodeNums, err := metaWrapper.ApplyQuota_ll(pathInfo.RootInode, quotaIdNum, maxConcurrencyInode)
 				if err != nil {
-					stdout("apply quota inodeNum %v failed  %v\n", inodeNums, err)
+					stdout("apply quota failed: %v\n", err)
+					return
 				}
 				totalNums += inodeNums
 			}
@@ -360,6 +356,7 @@ func newQuotaApplyCmd(client *master.MasterClient) *cobra.Command {
 
 func newQuotaRevokeCmd(client *master.MasterClient) *cobra.Command {
 	var maxConcurrencyInode uint64
+	var forceInode uint64
 	var cmd = &cobra.Command{
 		Use:   cmdQuotaRevokeUse,
 		Short: cmdQuotaRevokeShort,
@@ -369,11 +366,7 @@ func newQuotaRevokeCmd(client *master.MasterClient) *cobra.Command {
 			quotaId := args[1]
 			var err error
 			var quotaInfo *proto.QuotaInfo
-
-			if quotaInfo, err = client.AdminAPI().GetQuota(volName, quotaId); err != nil {
-				stdout("volName %v get quota %v failed(%v)\n", volName, quotaId, err)
-				return
-			}
+			var totalNums uint64
 
 			var metaConfig = &meta.MetaConfig{
 				Volume:  volName,
@@ -385,65 +378,51 @@ func newQuotaRevokeCmd(client *master.MasterClient) *cobra.Command {
 				stdout("NewMetaWrapper failed: %v\n", err)
 				return
 			}
-
-			var totalNums uint64
 			var quotaIdNum uint32
 			tmp, err := strconv.ParseUint(quotaId, 10, 32)
 			quotaIdNum = uint32(tmp)
-			for _, pathInfo := range quotaInfo.PathInfos {
-				inodeNums, err := metaWrapper.RevokeQuota_ll(pathInfo.RootInode, quotaIdNum, maxConcurrencyInode)
-				if err != nil {
-					stdout("revoke quota inodeNums %v failed %v\n", inodeNums, err)
+			if forceInode == 0 {
+				if quotaInfo, err = client.AdminAPI().GetQuota(volName, quotaId); err != nil {
+					stdout("volName %v get quota %v failed(%v)\n", volName, quotaId, err)
+					return
 				}
-				totalNums += inodeNums
+
+				for _, pathInfo := range quotaInfo.PathInfos {
+					inodeNums, err := metaWrapper.RevokeQuota_ll(pathInfo.RootInode, quotaIdNum, maxConcurrencyInode)
+					if err != nil {
+						stdout("revoke quota inodeNums %v failed %v\n", inodeNums, err)
+					}
+					totalNums += inodeNums
+				}
+			} else {
+				totalNums, err = metaWrapper.RevokeQuota_ll(forceInode, quotaIdNum, maxConcurrencyInode)
+				if err != nil {
+					stdout("revoke quota inodeNums %v failed %v\n", totalNums, err)
+				}
 			}
 			stdout("revoke num [%v] success.\n", totalNums)
 		},
 	}
 	cmd.Flags().Uint64Var(&maxConcurrencyInode, CliFlagMaxConcurrencyInode, 1000, "max concurrency delete Inodes")
+	cmd.Flags().Uint64Var(&forceInode, CliFlagForceInode, 0, "force revoke quota inode")
 	return cmd
 }
 
 func checkNestedDirectories(paths []string) error {
 	for i, path := range paths {
 		for j := i + 1; j < len(paths); j++ {
-			if isAncestor(path, paths[j]) {
+			if path == paths[j] {
+				return fmt.Errorf("the same directories found: %s", path)
+			}
+
+			if proto.IsAncestor(path, paths[j]) {
+				return fmt.Errorf("Nested directories found: %s and %s", path, paths[j])
+			}
+
+			if proto.IsAncestor(paths[j], path) {
 				return fmt.Errorf("Nested directories found: %s and %s", path, paths[j])
 			}
 		}
 	}
 	return nil
 }
-
-func isAncestor(parent, child string) bool {
-	if parent == child {
-		return false
-	}
-	rel, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false
-	}
-	return !strings.HasPrefix(rel, "..")
-}
-
-/*
-func hasNestedPaths(paths []string) bool {
-	for i, path1 := range paths {
-		absPath1, _ := filepath.Abs(path1)
-
-		for j, path2 := range paths {
-			if i == j {
-				continue
-			}
-
-			absPath2, _ := filepath.Abs(path2)
-
-			if filepath.HasPrefix(absPath1, absPath2) ||
-				filepath.HasPrefix(absPath2, absPath1) {
-				return true
-			}
-		}
-	}
-
-	return false
-}*/

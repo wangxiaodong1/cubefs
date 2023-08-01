@@ -46,6 +46,9 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 		return
 	}
 
+	mp.nonIdempotent.Lock()
+	defer mp.nonIdempotent.Unlock()
+
 	switch msg.Op {
 	case opFSMCreateInode:
 		ino := NewInode(0, 0)
@@ -79,7 +82,11 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 		if err = ino.Unmarshal(msg.V); err != nil {
 			return
 		}
-		resp = mp.fsmUnlinkInode(ino)
+		resp = mp.fsmUnlinkInode(ino, 0)
+	case opFSMUnlinkInodeOnce:
+		inoOnce := InodeOnceUnmarshal(msg.V)
+		ino := NewInode(inoOnce.Inode, 0)
+		resp = mp.fsmUnlinkInode(ino, inoOnce.UniqID)
 	case opFSMUnlinkInodeBatch:
 		inodes, err := InodeBatchUnmarshal(msg.V)
 		if err != nil {
@@ -97,7 +104,11 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 		if err = ino.Unmarshal(msg.V); err != nil {
 			return
 		}
-		resp = mp.fsmCreateLinkInode(ino)
+		resp = mp.fsmCreateLinkInode(ino, 0)
+	case opFSMCreateLinkInodeOnce:
+		inoOnce := InodeOnceUnmarshal(msg.V)
+		ino := NewInode(inoOnce.Inode, 0)
+		resp = mp.fsmCreateLinkInode(ino, inoOnce.UniqID)
 	case opFSMEvictInode:
 		ino := NewInode(0, 0)
 		if err = ino.Unmarshal(msg.V); err != nil {
@@ -196,6 +207,9 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 		txRbInodeTree := mp.txProcessor.txResource.txRbInodeTree.GetTree()
 		txRbDentryTree := mp.txProcessor.txResource.txRbDentryTree.GetTree()
 		txId := mp.txProcessor.txManager.txIdAlloc.getTransactionID()
+		quotaRebuild := mp.mqMgr.statisticRebuildStart()
+		uidRebuild := mp.acucumRebuildStart()
+		uniqChecker := mp.uniqChecker.clone()
 		msg := &storeMsg{
 			command:        opFSMStoreTick,
 			applyIndex:     index,
@@ -207,7 +221,11 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 			txTree:         txTree,
 			txRbInodeTree:  txRbInodeTree,
 			txRbDentryTree: txRbDentryTree,
+			quotaRebuild:   quotaRebuild,
+			uidRebuild:     uidRebuild,
+			uniqChecker:    uniqChecker,
 		}
+		log.LogDebugf("opFSMStoreTick: quotaRebuild [%v] uidRebuild [%v]", quotaRebuild, uidRebuild)
 		mp.storeChan <- msg
 	case opFSMInternalDeleteInode:
 		err = mp.internalDelete(msg.V)
@@ -360,6 +378,26 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 			return
 		}
 		resp = mp.fsmTxCreateLinkInode(txIno)
+	case opFSMSetInodeQuotaBatch:
+		req := &proto.BatchSetMetaserverQuotaReuqest{}
+		if err = json.Unmarshal(msg.V, req); err != nil {
+			return
+		}
+		resp = mp.fsmSetInodeQuotaBatch(req)
+	case opFSMDeleteInodeQuotaBatch:
+		req := &proto.BatchDeleteMetaserverQuotaReuqest{}
+		if err = json.Unmarshal(msg.V, req); err != nil {
+			return
+		}
+		resp = mp.fsmDeleteInodeQuotaBatch(req)
+	case opFSMUniqID:
+		resp = mp.fsmUniqID(msg.V)
+	case opFSMUniqCheckerEvict:
+		req := &fsmEvictUniqCheckerRequest{}
+		if err = json.Unmarshal(msg.V, req); err != nil {
+			return
+		}
+		err = mp.fsmUniqCheckerEvict(req)
 	}
 
 	return
@@ -418,6 +456,7 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		index          int
 		appIndexID     uint64
 		txID           uint64
+		uniqID         uint64
 		cursor         uint64
 		inodeTree      = NewBtree()
 		dentryTree     = NewBtree()
@@ -426,11 +465,52 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		txTree         = NewBtree()
 		txRbInodeTree  = NewBtree()
 		txRbDentryTree = NewBtree()
+		uniqChecker    = newUniqChecker()
 	)
+
+	blockUntilStoreSnapshot := func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		log.LogWarnf("ApplySnapshot: start to block until store snapshot to disk, mp %d, appid %d", mp.config.PartitionId, appIndexID)
+		start := time.Now()
+
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(start) > time.Minute*20 {
+					msg := fmt.Sprintf("ApplySnapshot: wait store snapshot timeout after 20 minutes, mp %d, appId %d, storeId %d",
+						mp.config.PartitionId, appIndexID, mp.storedApplyId)
+					log.LogErrorf(msg)
+					err = fmt.Errorf(msg)
+					return
+				}
+
+				msg := fmt.Sprintf("ApplySnapshot: start check storedApplyId, mp %d appId %d, storeAppId %d, cost %s",
+					mp.config.PartitionId, appIndexID, mp.storedApplyId, time.Since(start).String())
+				if time.Since(start) > time.Minute {
+					log.LogWarnf("still block after one minute, msg %s", msg)
+				} else {
+					log.LogInfo(msg)
+				}
+
+				if mp.storedApplyId >= appIndexID {
+					log.LogWarnf("ApplySnapshot: store snapshot success, msg %s", msg)
+					return
+				}
+			case <-mp.stopC:
+				log.LogWarnf("ApplySnapshot: revice stop signal, exit now, partition(%d), applyId(%d)", mp.config.PartitionId, mp.applyID)
+				err = errors.New("server has been shutdown when block")
+				return
+			}
+		}
+
+	}
 
 	defer func() {
 		if err == io.EOF {
 			mp.applyID = appIndexID
+			mp.config.UniqId = uniqID
 			mp.txProcessor.txManager.txIdAlloc.setTransactionID(txID)
 			mp.inodeTree = inodeTree
 			mp.dentryTree = dentryTree
@@ -440,6 +520,7 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 			mp.txProcessor.txManager.txTree = txTree
 			mp.txProcessor.txResource.txRbInodeTree = txRbInodeTree
 			mp.txProcessor.txResource.txRbDentryTree = txRbDentryTree
+			mp.uniqChecker = uniqChecker
 
 			err = nil
 			// store message
@@ -447,19 +528,20 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				command:        opFSMStoreTick,
 				applyIndex:     mp.applyID,
 				txId:           mp.txProcessor.txManager.txIdAlloc.getTransactionID(),
-				inodeTree:      mp.inodeTree,
-				dentryTree:     mp.dentryTree,
-				extendTree:     mp.extendTree,
-				multipartTree:  mp.multipartTree,
-				txTree:         mp.txProcessor.txManager.txTree,
-				txRbInodeTree:  mp.txProcessor.txResource.txRbInodeTree,
-				txRbDentryTree: mp.txProcessor.txResource.txRbDentryTree,
+				inodeTree:      mp.inodeTree.GetTree(),
+				dentryTree:     mp.dentryTree.GetTree(),
+				extendTree:     mp.extendTree.GetTree(),
+				multipartTree:  mp.multipartTree.GetTree(),
+				txTree:         mp.txProcessor.txManager.txTree.GetTree(),
+				txRbInodeTree:  mp.txProcessor.txResource.txRbInodeTree.GetTree(),
+				txRbDentryTree: mp.txProcessor.txResource.txRbDentryTree.GetTree(),
+				uniqChecker:    uniqChecker.clone(),
 			}
-
 			select {
 			case mp.extReset <- struct{}{}:
-				log.LogDebugf("ApplySnapshot: finish with EOF: partitionID(%v) applyID(%v), cursor(%v)",
-					mp.config.PartitionId, mp.applyID, mp.config.Cursor)
+				log.LogDebugf("ApplySnapshot: finish with EOF: partitionID(%v) applyID(%v), txID(%v), uniqID(%v), cursor(%v)",
+					mp.config.PartitionId, mp.applyID, mp.txProcessor.txManager.txIdAlloc.getTransactionID(), mp.config.UniqId, mp.config.Cursor)
+				blockUntilStoreSnapshot()
 				return
 			case <-mp.stopC:
 				log.LogWarnf("ApplySnapshot: revice stop signal, exit now, partition(%d), applyId(%d)", mp.config.PartitionId, mp.applyID)
@@ -474,20 +556,33 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		if err != nil {
 			return
 		}
+
+		if index == 0 {
+			appIndexID = binary.BigEndian.Uint64(data)
+			log.LogDebugf("ApplySnapshot: partitionID(%v), temporary uint64 appIndexID:%v", mp.config.PartitionId, appIndexID)
+		}
+
 		snap := NewMetaItem(0, nil, nil)
 		if err = snap.UnmarshalBinary(data); err != nil {
-			log.LogWarnf("ApplySnapshot: snap.UnmarshalBinary failed, partitionID(%v) index(%v)",
-				mp.config.PartitionId, index)
+			if index == 0 {
+				//for compatibility, if leader send snapshot format int version_0, index=0 is applyId in uint64 and
+				// will cause snap.UnmarshalBinary err, then just skip index=0 and continue with the other fields
+				log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed in index=0, partitionID(%v), assuming snapshot format version_0",
+					mp.config.PartitionId)
+				index++
+				continue
+			}
+
+			log.LogInfof("ApplySnapshot: snap.UnmarshalBinary failed, partitionID(%v) index(%v)", mp.config.PartitionId, index)
 			err = errors.New("unmarshal snap data failed")
 			return
 		}
 
 		if index == 0 && snap.Op != opFSMSnapFormatVersion {
 			// check whether the snapshot format matches
-			log.LogWarnf("ApplySnapshot: error for snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
+			log.LogWarnf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect snap.Op:%v, actual snap.Op:%v",
 				mp.config.PartitionId, index, opFSMSnapFormatVersion, snap.Op)
-			err = errors.New("snapshot format not match")
-			return
+			//TODO: should return error here? or whether return error by a new config?
 		}
 
 		index++
@@ -496,11 +591,10 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 			// check whether the snapshot format version number matches
 			var snapFormatVer uint32
 			snapFormatVer = binary.BigEndian.Uint32(snap.V)
-			if snapFormatVer != CurrentSnapFormatVersion {
-				log.LogWarnf("ApplySnapshot: error for snapshot format not match, partitionID(%v), index:%v, expect ver:%v, actual ver:%v",
-					mp.config.PartitionId, index, CurrentSnapFormatVersion, snapFormatVer)
-				err = errors.New("snapshot format not match")
-				return
+			if snapFormatVer != mp.manager.metaNode.raftSyncSnapFormatVersion {
+				log.LogWarnf("ApplySnapshot: snapshot format not match, partitionID(%v), index:%v, expect ver:%v, actual ver:%v",
+					mp.config.PartitionId, index, mp.manager.metaNode.raftSyncSnapFormatVersion, snapFormatVer)
+				//TODO: should return error here? or whether return error by a new config?
 			}
 		case opFSMApplyId:
 			appIndexID = binary.BigEndian.Uint64(snap.V)
@@ -511,6 +605,9 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 		case opFSMCursor:
 			cursor = binary.BigEndian.Uint64(snap.V)
 			log.LogDebugf("ApplySnapshot: partitionID(%v) cursor:%v", mp.config.PartitionId, cursor)
+		case opFSMUniqIDSnap:
+			uniqID = binary.BigEndian.Uint64(snap.V)
+			log.LogDebugf("ApplySnapshot: partitionID(%v) uniqId:%v", mp.config.PartitionId, uniqID)
 		case opFSMCreateInode:
 			ino := NewInode(0, 0)
 
@@ -568,6 +665,13 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 			}
 			log.LogDebugf("ApplySnapshot: write snap extent delete file: partitonID(%v) filename(%v).",
 				mp.config.PartitionId, fileName)
+		case opFSMUniqCheckerSnap:
+			if err = uniqChecker.UnMarshal(snap.V); err != nil {
+				log.LogErrorf("ApplyUniqChecker: write snap uniqChecker fail")
+				return
+			}
+			log.LogDebugf("ApplySnapshot: write snap uniqChecker")
+
 		default:
 			err = fmt.Errorf("unknown op=%d", snap.Op)
 			return
@@ -651,4 +755,8 @@ func (mp *metaPartition) submit(op uint32, data []byte) (resp interface{}, err e
 
 func (mp *metaPartition) uploadApplyID(applyId uint64) {
 	atomic.StoreUint64(&mp.applyID, applyId)
+}
+
+func (mp *metaPartition) getApplyID() (applyId uint64) {
+	return atomic.LoadUint64(&mp.applyID)
 }

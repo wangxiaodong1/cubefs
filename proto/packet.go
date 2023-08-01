@@ -116,6 +116,8 @@ const (
 	OpMetaBatchSetInodeQuota    uint8 = 0x50
 	OpMetaBatchDeleteInodeQuota uint8 = 0x51
 	OpMetaGetInodeQuota         uint8 = 0x52
+	OpQuotaCreateInode          uint8 = 0x53
+	OpQuotaCreateDentry         uint8 = 0x54
 
 	// Operations: Master -> DataNode
 	OpCreateDataPartition           uint8 = 0x60
@@ -158,6 +160,9 @@ const (
 	OpMetaTxDeleteDentry uint8 = 0xA9
 	OpMetaTxUpdateDentry uint8 = 0xAA
 	OpMetaTxLinkInode    uint8 = 0xAB
+
+	//Operations: Client -> MetaNode.
+	OpMetaGetUniqID uint8 = 0xAC
 
 	// Commons
 	OpNoSpaceErr         uint8 = 0xEE

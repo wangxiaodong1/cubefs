@@ -23,8 +23,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/cubefs/cubefs/blockcache/bcache"
-	"github.com/cubefs/cubefs/util/auditlog"
 	"io/ioutil"
 	syslog "log"
 	"net"
@@ -39,6 +37,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/cubefs/cubefs/blockcache/bcache"
+	"github.com/cubefs/cubefs/util/auditlog"
 
 	"github.com/cubefs/cubefs/util/buf"
 
@@ -756,6 +757,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.MaxStreamerLimit = GlobalMountOptions[proto.MaxStreamerLimit].GetInt64()
 	opt.EnableAudit = GlobalMountOptions[proto.EnableAudit].GetBool()
 	opt.RequestTimeout = GlobalMountOptions[proto.RequestTimeout].GetInt64()
+	opt.MinWriteAbleDataPartitionCnt = int(GlobalMountOptions[proto.MinWriteAbleDataPartitionCnt].GetInt64())
 
 	if opt.MountPoint == "" || opt.Volname == "" || opt.Owner == "" || opt.Master == "" {
 		return nil, errors.New(fmt.Sprintf("invalid config file: lack of mandatory fields, mountPoint(%v), volName(%v), owner(%v), masterAddr(%v)", opt.MountPoint, opt.Volname, opt.Owner, opt.Master))
@@ -845,6 +847,7 @@ func loadConfFromMaster(opt *proto.MountOptions) (err error) {
 	opt.EbsBlockSize = volumeInfo.ObjBlockSize
 	opt.CacheAction = volumeInfo.CacheAction
 	opt.CacheThreshold = volumeInfo.CacheThreshold
+	opt.EnableQuota = volumeInfo.EnableQuota
 	opt.EnableTransaction = volumeInfo.EnableTransaction
 	opt.TxTimeout = volumeInfo.TxTimeout
 	opt.TxConflictRetryNum = volumeInfo.TxConflictRetryNum

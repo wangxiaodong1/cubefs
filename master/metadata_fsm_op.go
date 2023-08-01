@@ -40,6 +40,7 @@ type clusterValue struct {
 	Threshold                   float32
 	LoadFactor                  float32
 	DisableAutoAllocate         bool
+	ForbidMpDecommission        bool
 	DataNodeDeleteLimitRate     uint64
 	MetaNodeDeleteBatchCount    uint64
 	MetaNodeDeleteWorkerSleepMs uint64
@@ -68,6 +69,7 @@ func newClusterValue(c *Cluster) (cv *clusterValue) {
 		MetaNodeDeleteWorkerSleepMs: c.cfg.MetaNodeDeleteWorkerSleepMs,
 		DataNodeAutoRepairLimitRate: c.cfg.DataNodeAutoRepairLimitRate,
 		DisableAutoAllocate:         c.DisableAutoAllocate,
+		ForbidMpDecommission:        c.ForbidMpDecommission,
 		MaxDpCntLimit:               c.cfg.MaxDpCntLimit,
 		FaultDomain:                 c.FaultDomain,
 		DiskQosEnable:               c.diskQosEnable,
@@ -247,11 +249,15 @@ type volValue struct {
 	CacheLRUInterval int
 	CacheRule        string
 
-	EnablePosixAcl                                         bool
-	EnableTransaction                                      uint8
-	TxTimeout                                              int64
-	TxConflictRetryNum                                     int64
-	TxConflictRetryInterval                                int64
+	EnablePosixAcl bool
+	EnableQuota    bool
+
+	EnableTransaction       uint8
+	TxTimeout               int64
+	TxConflictRetryNum      int64
+	TxConflictRetryInterval int64
+	TxOpLimit               int
+
 	VolQosEnable                                           bool
 	DiskQosEnable                                          bool
 	IopsRLimit, IopsWLimit, FlowRlimit, FlowWlimit         uint64
@@ -287,10 +293,12 @@ func newVolValue(vol *Vol) (vv *volValue) {
 		DpSelectorParm:          vol.dpSelectorParm,
 		DefaultPriority:         vol.defaultPriority,
 		EnablePosixAcl:          vol.enablePosixAcl,
+		EnableQuota:             vol.enableQuota,
 		EnableTransaction:       vol.enableTransaction,
 		TxTimeout:               vol.txTimeout,
 		TxConflictRetryNum:      vol.txConflictRetryNum,
 		TxConflictRetryInterval: vol.txConflictRetryInterval,
+		TxOpLimit:               vol.txOpLimit,
 
 		VolType:             vol.VolType,
 		EbsBlkSize:          vol.EbsBlkSize,
@@ -947,6 +955,7 @@ func (c *Cluster) loadClusterValue() (err error) {
 		//c.cfg.DirChildrenNumLimit = cv.DirChildrenNumLimit
 		c.cfg.ClusterLoadFactor = cv.LoadFactor
 		c.DisableAutoAllocate = cv.DisableAutoAllocate
+		c.ForbidMpDecommission = cv.ForbidMpDecommission
 		c.diskQosEnable = cv.DiskQosEnable
 		c.cfg.QosMasterAcceptLimit = cv.QosLimitUpload
 		c.DecommissionLimit = cv.DecommissionLimit //dont update nodesets limit for nodesets are not loaded

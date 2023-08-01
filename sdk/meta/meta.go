@@ -86,7 +86,6 @@ type MetaConfig struct {
 	OnAsyncTaskError AsyncTaskErrorFunc
 	EnableSummary    bool
 	MetaSendTimeout  int64
-	UpdateQuota      bool
 	//EnableTransaction uint8
 	//EnableTransaction bool
 }
@@ -147,8 +146,18 @@ type MetaWrapper struct {
 	TxTimeout               int64
 	TxConflictRetryNum      int64
 	TxConflictRetryInterval int64
+	EnableQuota             bool
 	QuotaInfoMap            map[uint32]*proto.QuotaInfo
 	QuotaLock               sync.RWMutex
+
+	// uniqidRange for request dedup
+	uniqidRangeMap   map[uint64]*uniqidRange
+	uniqidRangeMutex sync.Mutex
+}
+
+type uniqidRange struct {
+	cur uint64
+	end uint64
 }
 
 // the ticket from authnode
@@ -195,6 +204,7 @@ func NewMetaWrapper(config *MetaConfig) (*MetaWrapper, error) {
 	mw.EnableSummary = config.EnableSummary
 	mw.DirChildrenNumLimit = proto.DefaultDirChildrenNumLimit
 	//mw.EnableTransaction = config.EnableTransaction
+	mw.uniqidRangeMap = make(map[uint64]*uniqidRange, 0)
 
 	limit := 0
 
@@ -223,10 +233,8 @@ func NewMetaWrapper(config *MetaConfig) (*MetaWrapper, error) {
 	if limit <= 0 && err != nil {
 		return nil, err
 	}
-	if config.UpdateQuota {
-		go mw.updateQuotaInfoTick()
-	}
 
+	go mw.updateQuotaInfoTick()
 	go mw.refresh()
 	return mw, nil
 }

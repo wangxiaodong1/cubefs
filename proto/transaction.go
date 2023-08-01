@@ -61,6 +61,7 @@ const (
 	TxOpMaskSymlink uint8 = 0x20
 	TxOpMaskLink    uint8 = 0x40
 	TxOpMaskAll     uint8 = 0x7F
+	TxPause         uint8 = 0xFF
 )
 
 var GTxMaskMap = map[string]uint8{
@@ -76,6 +77,9 @@ var GTxMaskMap = map[string]uint8{
 }
 
 func GetMaskString(mask uint8) (maskStr string) {
+	if mask == TxPause {
+		return "pause"
+	}
 	for k, v := range GTxMaskMap {
 		if k == "all" {
 			continue
@@ -113,7 +117,10 @@ func GetMaskFromString(maskStr string) (mask uint8, err error) {
 		err = txInvalidMask()
 		return
 	}
-
+	if maskStr == "pause" {
+		mask = TxPause
+		return
+	}
 	arr := strings.Split(maskStr, "|")
 
 	optNum := len(arr)
@@ -475,20 +482,26 @@ const (
 	TxStateInit int32 = iota
 	TxStatePreCommit
 	TxStateCommit
+	TxStateCommitDone
 	TxStateRollback
 	TxStateFailed
 )
 
 type TransactionInfo struct {
-	TxID       string // "metapartitionId_atomicId", if empty, mp should be TM, otherwise it will be RM
-	TxType     uint32
-	TmID       int64
-	CreateTime int64 //time.Now().UnixNano()
-	Timeout    int64 //minutes
-	State      int32
-	//ItemMap    map[string]TxItemInfo
+	TxID          string // "metapartitionId_atomicId", if empty, mp should be TM, otherwise it will be RM
+	TxType        uint32
+	TmID          int64
+	CreateTime    int64 //time.Now().UnixNano()
+	Timeout       int64 //minutes
+	State         int32
+	DoneTime      int64
 	TxInodeInfos  map[uint64]*TxInodeInfo
 	TxDentryInfos map[string]*TxDentryInfo
+}
+
+// wait in case repeat request after commit.
+func (txInfo *TransactionInfo) IsDoneAndNoNeedWait(timeNow int64) (done bool) {
+	return txInfo.State == TxStateCommitDone && (timeNow-txInfo.DoneTime > 60)
 }
 
 func (txInfo *TransactionInfo) IsExpired() (expired bool) {

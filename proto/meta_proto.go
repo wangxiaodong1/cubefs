@@ -100,6 +100,7 @@ type QuotaHeartBeatInfo struct {
 	VolName     string
 	QuotaId     uint32
 	LimitedInfo QuotaLimitedInfo
+	Enable      bool
 }
 
 type MetaQuotaInfos struct {
@@ -108,7 +109,7 @@ type MetaQuotaInfos struct {
 }
 
 type MetaQuotaInfo struct {
-	RootInode bool
+	RootInode bool `json:"rid"`
 }
 
 type QuotaPathInfo struct {
