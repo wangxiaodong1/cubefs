@@ -66,7 +66,7 @@ mysql:
 ## 2.2 上架集群、修改集群<br>
 ### 2.2.1 上架集群<br>
 ![image](pic/gui/2.2.1_1.png)<br>
-只有三副本卷、无EC冷卷<br>
+只有三副本卷、无纠删码（EC）冷卷<br>
 ![image](pic/gui/2.2.1_2.png)<br>
 有EC冷卷<br>
 ![image](pic/gui/2.2.1_3.png)<br>
@@ -214,11 +214,11 @@ admin/Admin@1234<br>
 三个默认角：<br>
 admin_role：拥有所有权限<br>
 operator_role：定位为运维角色，相比admin_role削减了权限管理相关权限<br>
-viewer_role：定位为运维角色，相比operator_role削减了运维操作相关权限<br>
+viewer_role：定位为查看角色，相比operator_role削减了运维操作相关权限<br>
 #### 2.10.1.3 用户<br>
 一个用户可以关联多个角色，用户拥有对应角色的权限<br>
 #### 2.10.1.4 用户申请方式<br>
-a. 不登录申请<br>
+a. 在登录界面申请<br>
 b. 有“创建用户”权限的账户在“用户管理”->“添加用户”里面创建<br>
 ### 2.10.2 用户管理<br>
 #### 2.10.2.1 添加用户<br>
